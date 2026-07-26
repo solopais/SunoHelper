@@ -75,7 +75,7 @@ struct GeneratePayload: Encodable {
 
     static func extend(clipId: String, at: Double, model: String, note: String) -> GeneratePayload {
         var p = GeneratePayload(make_instrumental: false, mv: model, prompt: note,
-                                 continue_clip_id: clipId, continue_at: at, task: "extend")
+                                 continue_at: at, continue_clip_id: clipId, task: "extend")
         return p
     }
 }
