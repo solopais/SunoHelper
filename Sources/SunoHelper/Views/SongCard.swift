@@ -38,7 +38,7 @@ struct SongCard: View {
                             .font(.caption).foregroundColor(AppTheme.textSecondary)
                             .lineLimit(1)
                     }
-                    Text(song.pending ? "生成中…" : (song.createdAtDate as NSDate).description(with: .current))
+                    Text(song.pending ? "生成中…" : (song.createdAtDate as NSDate).description(with: Locale.current))
                         .font(.caption2).foregroundColor(song.pending ? AppTheme.accent : AppTheme.textSecondary)
                 }
 
@@ -70,7 +70,7 @@ struct SongCard: View {
 
             // 操作行
             HStack(spacing: 18) {
-                compactAction(icon: dl.isDownloading(audioKey) ? "arrow.down.circle" : (dl.isDownloaded(song.downloadedLocalPath) ? "checkmark.circle.fill" : "arrow.down.circle"),
+                compactAction(icon: dl.isDownloading(audioKey) ? "arrow.down.circle" : (dl.isDownloaded(path: song.downloadedLocalPath) ? "checkmark.circle.fill" : "arrow.down.circle"),
                               label: dlStatusLabel) {
                     download()
                 }
@@ -133,7 +133,7 @@ struct SongCard: View {
     }
 
     private var dlStatusLabel: String {
-        if dl.isDownloaded(song.downloadedLocalPath) { return "已保存" }
+        if dl.isDownloaded(path: song.downloadedLocalPath) { return "已保存" }
         if dl.isDownloading(audioKey) { return dl.status[audioKey] ?? "下载中" }
         return "下载"
     }

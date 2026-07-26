@@ -1,7 +1,8 @@
 .DS_Store
 build/
-DerivedData/
 Payload/
+DerivedData/
 *.log
-*.xcodeproj
-*.xcworkspace
+joblog*.txt
+SunoHelper-artifact.zip
+SunoHelper_extract/
