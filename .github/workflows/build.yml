@@ -1,0 +1,106 @@
+name: Build SunoHelper IPA
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'Sources/**'
+      - 'Resources/**'
+      - 'project.yml'
+      - 'SunoHelper.entitlements'
+      - 'scripts/**'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 15
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "15.4"
+
+      - name: Generate app icon set
+        run: |
+          set -e
+          python3 scripts/make_icons.py
+          echo "✅ 图标已生成"
+
+      - name: Install XcodeGen
+        timeout-minutes: 10
+        run: |
+          set -e
+          XCG_VERSION="2.35.0"
+          XCG_URL="https://github.com/yonaskolb/XcodeGen/releases/download/${XCG_VERSION}/xcodegen.zip"
+          if curl -fSL "$XCG_URL" -o /tmp/xcodegen.zip; then
+            mkdir -p /usr/local/bin
+            unzip -o /tmp/xcodegen.zip -d /tmp/xcodegen_tmp/
+            FOUND=$(find /tmp/xcodegen_tmp -type f -name "xcodegen" | head -1)
+            if [ -n "$FOUND" ]; then
+              cp "$FOUND" /usr/local/bin/xcodegen
+              chmod +x /usr/local/bin/xcodegen
+              rm -rf /tmp/xcodegen_tmp /tmp/xcodegen.zip
+              echo "✅ XcodeGen 二进制安装成功"
+              xcodegen version
+              exit 0
+            fi
+          fi
+          echo "--- Homebrew 安装 ---"
+          brew update --auto-update || true
+          brew install xcodegen
+          xcodegen version
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml
+
+      - name: Build .app (unsigned)
+        timeout-minutes: 15
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project SunoHelper.xcodeproj \
+            -scheme SunoHelper \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            2>&1 | tee build.log || (echo "❌ 构建失败，尾部日志：" && tail -50 build.log && exit 1)
+
+      # Ad-hoc 签名：TrollStore 安装时会用自己的证书重新签名
+      - name: Ad-hoc sign + inject entitlements
+        run: |
+          APP=$(find build -name "*.app" -path "*iphoneos*" | head -1)
+          echo "📦 找到 App 包: $APP"
+          if [ -z "$APP" ]; then echo "❌ 未找到 .app 构建产物" && exit 1; fi
+          codesign --force --deep --sign - --entitlements SunoHelper.entitlements "$APP"
+          echo "✅ Ad-hoc 签名完成"
+
+      - name: Create IPA payload
+        run: |
+          APP=$(find build -name "*.app" -path "*iphoneos*" | head -1)
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -r SunoHelper.ipa Payload/
+          rm -rf Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: SunoHelper.ipa
+          path: SunoHelper.ipa
+          compression-level: 0
+
+      - name: Upload .app bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: SunoHelper.app
+          path: build/Build/Products/Release-iphoneos/*.app
+          compression-level: 0
