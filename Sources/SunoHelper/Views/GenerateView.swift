@@ -17,6 +17,8 @@ struct GenerateView: View {
     @State private var model = SunoModels.defaultMV
     @State private var busy = false
     @State private var message = ""
+    @State private var showWebViewCreate = false
+    @State private var captchaBlocked = false
 
     // 续写模式（从音乐库点「续写」进入）
     private let extendClipID: String?
@@ -119,6 +121,19 @@ struct GenerateView: View {
                             .padding(.horizontal, 16)
                     }
 
+                    if captchaBlocked {
+                        Button(action: { showWebViewCreate = true }) {
+                            Label("去 Suno 网页创作（绕过人机验证）", systemImage: "globe")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                                .background(AppTheme.accent)
+                                .foregroundColor(.white)
+                                .clipShape(RoundedRectangle(cornerRadius: 12))
+                        }
+                        .padding(.horizontal, 16)
+                    }
+
                     Button(action: runGenerate) {
                         HStack {
                             if busy { ProgressView().tint(.white) }
@@ -134,6 +149,17 @@ struct GenerateView: View {
                     .disabled(busy || (extendClipID == nil && prompt.trimmingCharacters(in: .whitespaces).isEmpty))
                     .padding(.horizontal, 16)
 
+                    Button(action: { showWebViewCreate = true }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "globe")
+                            Text("Suno 官网创作（绕过验证）").underline()
+                        }
+                        .font(.footnote)
+                        .foregroundColor(AppTheme.accent)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, 16)
+
                     Spacer(minLength: 20)
                 }
                 .padding(.top, 12)
@@ -142,6 +168,9 @@ struct GenerateView: View {
             .background(AppTheme.bg)
             .navigationTitle(extendClipID != nil ? "续写歌曲" : "创作")
             .navigationBarTitleDisplayMode(.inline)
+            .fullScreenCover(isPresented: $showWebViewCreate) {
+                CreateWebView()
+            }
         }
     }
 
@@ -152,6 +181,7 @@ struct GenerateView: View {
         }
         busy = true
         message = "提交生成任务…"
+        captchaBlocked = false
 
         let payload: GeneratePayload
         if let ext = extendClipID {
@@ -193,6 +223,9 @@ struct GenerateView: View {
                 await MainActor.run {
                     busy = false
                     message = "❌ \(error.localizedDescription)"
+                    if let se = error as? SunoError, case .captcha = se {
+                        captchaBlocked = true
+                    }
                 }
             }
         }

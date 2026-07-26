@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 
 struct LibraryView: View {
     @StateObject private var store = SongStore.shared
@@ -73,6 +74,9 @@ struct LibraryView: View {
         .onAppear {
             guard !didInitialLoad, session.isLoggedIn else { return }
             didInitialLoad = true
+            Task { await reloadLibrary() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("SunoReloadLibrary"))) { _ in
             Task { await reloadLibrary() }
         }
         .sheet(isPresented: $showExtend) {
