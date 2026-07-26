@@ -5,8 +5,6 @@ private enum GenMode: String, CaseIterable {
     case custom = "自定义"
 }
 
-private let MODELS = ["chirp-v3-5", "chirp-v4", "chirp-v4-5", "chirp-v4-5-turbo", "chirp-v4-5-8s"]
-
 struct GenerateView: View {
     @StateObject private var session = SunoSession.shared
     @StateObject private var store = SongStore.shared
@@ -16,7 +14,7 @@ struct GenerateView: View {
     @State private var tags = ""
     @State private var title = ""
     @State private var instrumental = false
-    @State private var model = "chirp-v3-5"
+    @State private var model = SunoModels.defaultMV
     @State private var busy = false
     @State private var message = ""
 
@@ -105,8 +103,8 @@ struct GenerateView: View {
                         Text("模型").foregroundColor(AppTheme.textSecondary).font(.subheadline)
                         Spacer()
                         Picker("模型", selection: $model) {
-                            ForEach(MODELS, id: \.self) { m in
-                                Text(m).tag(m)
+                            ForEach(SunoModels.all) { m in
+                                Text(m.label).tag(m.mv)
                             }
                         }
                         .pickerStyle(.menu)

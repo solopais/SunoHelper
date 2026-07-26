@@ -6,3 +6,8 @@ DerivedData/
 joblog*.txt
 SunoHelper-artifact.zip
 SunoHelper_extract/
+ipa_extract/
+*.ipa
+suno_cookie.txt
+scripts/probe*.py
+probe.py

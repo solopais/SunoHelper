@@ -45,6 +45,21 @@ final class SongStore: ObservableObject {
         }
     }
 
+    /// 合并从 Suno 拉回的音乐库（保留本地已下载路径），按创建时间倒序
+    func mergeRemote(_ remote: [Song]) {
+        for r in remote {
+            if let idx = items.firstIndex(where: { $0.id == r.id }) {
+                var merged = r
+                merged.downloadedLocalPath = items[idx].downloadedLocalPath
+                items[idx] = merged
+            } else {
+                items.append(r)
+            }
+        }
+        items.sort { $0.createdAt > $1.createdAt }
+        save()
+    }
+
     func remove(_ song: Song) {
         items.removeAll { $0.id == song.id }
         save()
