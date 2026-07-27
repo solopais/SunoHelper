@@ -14,7 +14,6 @@ final class S3UploadWebView {
 
     private var webView: WKWebView?
     private var pageInitialized = false
-    private let lock = NSLock()
 
     private init() {}
 
@@ -183,14 +182,15 @@ final class S3UploadWebView {
     @MainActor
     private func getCurrentURL() async -> String? {
         guard let wv = webView else { return nil }
-        return try? await wv.evaluateJavaScript("window.location.href") as? String
+        let result = try? await wv.evaluateJavaScript("window.location.href")
+        return result as? String
     }
 
     /// 手动注入 JS（页面加载超时的兜底）
     @MainActor
     private func injectJSManually() async {
         guard let wv = webView else { return }
-        try? await wv.evaluateJavaScript(S3UploadWebView.uploadJS)
+        _ = try? await wv.evaluateJavaScript(S3UploadWebView.uploadJS)
     }
 
     /// 执行 JS 上传
@@ -217,22 +217,21 @@ final class S3UploadWebView {
     /// 确保 WKWebView 已加载 suno.com 页面且 JS 就绪
     private func ensureReady() async throws {
         // 快速路径：已初始化且就绪
-        lock.lock()
-        let initialized = pageInitialized
-        lock.unlock()
-        if initialized && await checkReady() { return }
+        if pageInitialized {
+            let ready = await checkReady()
+            if ready { return }
+        }
 
         await setupWebViewIfNeeded()
 
         // 轮询等待页面加载完成（最多 15 秒）
         for i in 0..<30 {
             try await Task.sleep(nanoseconds: 500_000_000)  // 0.5s
-            if await checkReady() {
+            let ready = await checkReady()
+            if ready {
                 let url = await getCurrentURL()
                 DebugLog.shared.info("S3上传", "suno.com 页面就绪 (url=\(url ?? "?"))")
-                lock.lock()
                 pageInitialized = true
-                lock.unlock()
                 return
             }
             if i == 0 {
@@ -244,9 +243,7 @@ final class S3UploadWebView {
         DebugLog.shared.warn("S3上传", "页面加载超时(15s)，尝试手动注入 JS...")
         await injectJSManually()
         try await Task.sleep(nanoseconds: 500_000_000)
-        lock.lock()
         pageInitialized = true
-        lock.unlock()
     }
 
     /// 上传文件到 S3
