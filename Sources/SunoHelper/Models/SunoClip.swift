@@ -186,8 +186,7 @@ struct GeneratePayload: Encodable {
     var make_instrumental: Bool = false
     var mv: String = SunoModels.defaultMV
     var prompt: String = ""                    // 自定义模式：歌词文本
-    var generation_type: String = "TEXT"        // TEXT / AUDIO_UPLOAD / COVER 等
-    var input: String = "TEXT"                 // TEXT / AUDIO / IMAGE / VIDEO / TWITTER / SIMPLE_REMIX（API 必填校验）
+    var generation_type: String = "TEXT"        // TEXT / AUDIO_UPLOAD / SIMPLE_REMIX 等（API 枚举校验）
     var gpt_description_prompt: String? = nil   // 简单/灵感模式提示词（≤200字）
     var tags: String? = nil                     // 风格标签（逗号分隔）
     var title: String? = nil                    // 歌曲标题
@@ -203,6 +202,7 @@ struct GeneratePayload: Encodable {
     // === 续写参数 ===
     var continue_at: Double? = nil
     var continue_clip_id: String? = nil
+    var cover_clip_id: String? = nil            // 翻唱(Cover) 基于的源歌曲 id（API 真实字段名）
     var task: String? = nil                     // "extend" / "whole" / "cover" 等
 
     // === 验证相关 ===
@@ -248,12 +248,12 @@ struct GeneratePayload: Encodable {
     }
 
     /// Cover 翻唱：基于已有歌曲重新生成（保留旋律/结构，换风格/人声）
+    /// 真实请求体（逆向官方 API）：task="cover" + cover_clip_id=<源歌曲id> + generation_type="TEXT"
     static func cover(clipId: String, model: String) -> GeneratePayload {
         var p = GeneratePayload(make_instrumental: false, mv: model)
-        p.continue_clip_id = clipId
         p.task = "cover"
-        p.generation_type = "COVER"
-        p.input = "AUDIO"   // 翻唱基于已有音频 clip
+        p.cover_clip_id = clipId
+        p.generation_type = "TEXT"
         return p
     }
 }

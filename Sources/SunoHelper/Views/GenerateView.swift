@@ -302,8 +302,7 @@ struct GenerateView: View {
                 if let audioData = pickedAudioData, let audioURL = pickedAudioURL {
                     message = "正在上传音频并提交创作任务…"
                     var audioPayload = buildPayload()
-                    audioPayload.generation_type = "AUDIO_UPLOAD"
-                    audioPayload.input = "AUDIO"
+                    audioPayload.generation_type = "AUDIO"
                     stubs = try await SunoAPI.shared.generateWithAudioData(fileData: audioData, fileName: audioURL.lastPathComponent, payload: audioPayload)
                 } else {
                     stubs = try await SunoAPI.shared.generate(payload: buildPayload())

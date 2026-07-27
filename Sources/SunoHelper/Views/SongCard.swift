@@ -101,13 +101,11 @@ struct SongCard: View {
                     onCover()
                 }
 
-                if !song.lyric.isEmpty {
-                    compactAction(icon: "text.alignleft", label: "歌词") {
-                        showLyrics = true
-                    }
+                // 歌词：始终占满 6 等分，无歌词时禁用，保证 6 个按钮等宽对齐
+                compactAction(icon: "text.alignleft", label: "歌词") {
+                    showLyrics = true
                 }
-
-                Spacer()
+                .disabled(song.lyric.isEmpty)
             }
         }
         .padding(14)

@@ -69,7 +69,7 @@ struct SunoAPI {
             let formFields: [(String, String?)] = [
                 ("make_instrumental", "\(payload.make_instrumental)"),
                 ("mv", payload.mv),
-                ("generation_type", "AUDIO_UPLOAD"),
+                ("generation_type", payload.generation_type),
                 ("prompt", payload.prompt.isEmpty ? nil : payload.prompt),
                 ("gpt_description_prompt", payload.gpt_description_prompt),
                 ("tags", payload.tags),
