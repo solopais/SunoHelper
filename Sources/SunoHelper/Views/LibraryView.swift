@@ -91,29 +91,55 @@ struct LibraryView: View {
         }
         await MainActor.run {
             refreshing = true
-            currentPage = 1   // Suno API page 从 1 开始
+            currentPage = 1
             hasMorePages = true
             allLoaded = false
             loadingMore = false
         }
 
         do {
-            // 先加载第 1 页，让用户立刻看到数据
+            // 先加载第 1 页，立即展示（用户 1 秒内看到数据）
             let resp = try await SunoAPI.shared.library(page: 1)
             let songs = resp.clips.map { Song.from(clip: $0) }
+            var lastHasMore = resp.has_more == true && !songs.isEmpty
+
             await MainActor.run {
                 if !songs.isEmpty {
                     store.replaceRemote(songs)
                 }
-                // 不使用 num_total_results（始终返回 21，不可靠）
-                // 只依赖 has_more 判断
                 currentPage = 2
-                hasMorePages = resp.has_more == true && !songs.isEmpty
-                allLoaded = !hasMorePages
-                refreshing = false
+                hasMorePages = lastHasMore
+                allLoaded = !lastHasMore
+                refreshing = false  // 第 1 页已展示，停止全屏刷新
             }
 
-            // 第 1 页成功后，后台继续预加载（不阻塞用户浏览）
+            // 同步加载第 2-3 页，追加到列表（用户 2-3 秒内看到 ~60 首）
+            if lastHasMore {
+                for page in 2...3 {
+                    try? await Task.sleep(nanoseconds: 800_000_000)  // 页间间隔防 429
+                    do {
+                        let resp2 = try await SunoAPI.shared.library(page: page)
+                        let songs2 = resp2.clips.map { Song.from(clip: $0) }
+                        lastHasMore = resp2.has_more == true && !songs2.isEmpty
+
+                        await MainActor.run {
+                            if !songs2.isEmpty {
+                                store.appendRemote(songs2)
+                            }
+                            currentPage = page + 1
+                            hasMorePages = lastHasMore
+                            allLoaded = !lastHasMore
+                        }
+
+                        if !lastHasMore || songs2.isEmpty { break }
+                    } catch {
+                        // 第 2-3 页失败不致命，用户已看到第 1 页
+                        break
+                    }
+                }
+            }
+
+            // 3 页加载完后，后台继续预加载剩余（不阻塞用户浏览）
             if hasMorePages && !allLoaded {
                 Task { await preloadRemaining() }
             }
@@ -140,30 +166,40 @@ struct LibraryView: View {
     /// 后台预加载剩余页面（用户可同时浏览已加载的歌曲）
     /// 注意：每页间隔 1.2 秒，避免触发 Suno API 的 429 限流（实测 14 页连续请求就限流）
     func preloadRemaining() async {
+        guard session.isLoggedIn else { return }
         guard !loadingMore, !allLoaded, hasMorePages else { return }
+
+        // 用局部变量控制循环，避免 @State 在后台线程的数据竞争
+        var page = currentPage
+        var hasMore = hasMorePages
+
         await MainActor.run { loadingMore = true }
 
         var consecutiveErrors = 0
-        while hasMorePages && !allLoaded {
+        while hasMore {
             do {
-                let resp = try await SunoAPI.shared.library(page: currentPage)
+                try? await Task.sleep(nanoseconds: 1_200_000_000)  // 每页间隔 1.2 秒防 429
+                let resp = try await SunoAPI.shared.library(page: page)
                 let newSongs = resp.clips.map { Song.from(clip: $0) }
                 let hadNew = !newSongs.isEmpty
+                hasMore = resp.has_more == true && hadNew
+                page += 1
+
                 await MainActor.run {
                     if hadNew { store.appendRemote(newSongs) }
-                    currentPage += 1
-                    // 只依赖 has_more + 是否有新数据判断（不使用 num_total_results）
-                    hasMorePages = resp.has_more == true && hadNew
-                    allLoaded = !hasMorePages || !hadNew
+                    currentPage = page
+                    hasMorePages = hasMore
+                    if !hasMore { allLoaded = true }
                 }
                 consecutiveErrors = 0
-                // 每页间隔 1.2 秒，避免 429 限流
-                try? await Task.sleep(nanoseconds: 1_200_000_000)
             } catch let error as SunoError {
                 consecutiveErrors += 1
                 if case .authExpired = error {
-                    await MainActor.run { refreshMsg = "登录已过期，请重新登录" }
-                    await MainActor.run { loadingMore = false }
+                    await MainActor.run {
+                        refreshMsg = "登录已过期，请重新登录"
+                        loadingMore = false
+                        allLoaded = true
+                    }
                     return
                 }
                 // 429 限流时等待更长时间重试
@@ -178,8 +214,12 @@ struct LibraryView: View {
                 }
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             } catch {
-                await MainActor.run { loadingMore = false }
-                return
+                consecutiveErrors += 1
+                if consecutiveErrors >= 3 {
+                    await MainActor.run { loadingMore = false }
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
         }
 

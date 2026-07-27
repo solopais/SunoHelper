@@ -136,10 +136,15 @@ struct GenerateView: View {
 
                     // MARK: - 提示消息
                     if !message.isEmpty {
-                        Text(message)
-                            .font(.footnote)
-                            .foregroundColor(message.contains("失败") || message.contains("过期") || message.contains("❌") ? AppTheme.error : AppTheme.textSecondary)
-                            .padding(.horizontal, 16)
+                        HStack(spacing: 8) {
+                            if busy {
+                                ProgressView().tint(AppTheme.accent).scaleEffect(0.7)
+                            }
+                            Text(message)
+                                .font(.footnote)
+                                .foregroundColor(message.contains("失败") || message.contains("过期") || message.contains("❌") ? AppTheme.error : AppTheme.textSecondary)
+                        }
+                        .padding(.horizontal, 16)
                     }
 
                     // MARK: - hCaptcha 回退按钮
@@ -239,6 +244,7 @@ struct GenerateView: View {
         if busy { return false }
         if extendClipID != nil { return true }  // 续写不需要必填
         if coverClipID != nil { return true }   // Cover 不需要必填
+        if pickedAudioData != nil { return true } // 选了音频文件即可上传，不需要 prompt
         return !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 

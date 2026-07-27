@@ -94,7 +94,7 @@ struct SunoAPI {
     /// Step 1: 请求 S3 预签名上传 URL
     func requestAudioUpload(fileExtension: String) async throws -> AudioUploadRequestResponse {
         try await run {
-            let url = URL(string: "\(SunoAPI.base)/api/uploads/audio")!
+            let url = URL(string: "\(SunoAPI.base)/api/uploads/audio/")!
             var req = URLRequest(url: url)
             req.httpMethod = "POST"
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
