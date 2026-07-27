@@ -125,83 +125,27 @@ struct SunoAPI {
     }
 
     /// Step 2: 上传文件到 S3（使用预签名 URL + form fields）
-    /// 修复 -1005：ephemeral session + data(for:) + httpBody，失败后 shared session 重试
-    /// 根因：upload(for:fromFile:) + Connection:close 均无效（URLSession 覆盖 Connection header）
-    /// 新方案：用 data(for:) + httpBody 避免文件流 API 的潜在 bug，ephemeral session 避免连接复用
+    /// 修复 -1005：改用 WKWebView fetch API 上传，绕过 URLSession 的 HTTP/2 连接断开问题
+    /// 详见 S3UploadWebView.swift
     func uploadFileToS3(presignedURL: String, fields: [String: String],
                         fileData: Data, fileName: String, mimeType: String) async throws {
         try await run {
-            let s3URL = URL(string: presignedURL)!
-            let boundary = "Boundary-\(UUID().uuidString)"
             let fieldsContentType = fields["Content-Type"] ?? mimeType
+            DebugLog.shared.info("S3上传", "fields=\(fields.keys.sorted()) CT=\(fieldsContentType) → WKWebView fetch")
 
-            DebugLog.shared.info("S3上传", "fields=\(fields.keys.sorted()) CT=\(fieldsContentType) url=\(presignedURL)")
+            let (status, body) = try await S3UploadWebView.shared.upload(
+                presignedURL: presignedURL,
+                fields: fields,
+                fileData: fileData,
+                mimeType: fieldsContentType
+            )
 
-            // 构造 multipart body
-            var body = Data()
-            for (key, value) in fields {
-                body.append(Data("--\(boundary)\r\n".utf8))
-                body.append(Data("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n".utf8))
-                body.append(Data("\(value)\r\n".utf8))
+            DebugLog.shared.info("S3上传", "WebView响应: \(status)")
+            if !(200...299).contains(status) {
+                DebugLog.shared.error("S3上传", "WebView失败[\(status)]: \(body.prefix(300))")
+                throw SunoError.uploadFailed("S3[\(status)]: \(body.prefix(200))")
             }
-            // file 字段（必须最后）
-            body.append(Data("--\(boundary)\r\n".utf8))
-            body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"upload.mp3\"\r\n".utf8))
-            body.append(Data("Content-Type: \(fieldsContentType)\r\n\r\n".utf8))
-            body.append(fileData)
-            body.append(Data("\r\n--\(boundary)--\r\n".utf8))
-
-            DebugLog.shared.info("S3上传", "body=\(body.count)B → ephemeral+data(for:)")
-
-            // 构造请求（用 httpBody 而非 upload(fromFile:)）
-            var req = URLRequest(url: s3URL)
-            req.httpMethod = "POST"
-            req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-            req.httpBody = body
-            req.timeoutInterval = 300
-
-            // 尝试 1: ephemeral session + data(for:)
-            let config = URLSessionConfiguration.ephemeral
-            config.urlCache = nil
-            config.httpMaximumConnectionsPerHost = 1
-            config.timeoutIntervalForRequest = 300
-            config.timeoutIntervalForResource = 600
-            let session = URLSession(configuration: config)
-
-            do {
-                let (data, resp) = try await session.data(for: req)
-                if let http = resp as? HTTPURLResponse {
-                    DebugLog.shared.info("S3上传", "ephemeral响应: \(http.statusCode)")
-                    if !(200...299).contains(http.statusCode) {
-                        let msg = String(data: data, encoding: .utf8) ?? "(empty)"
-                        DebugLog.shared.error("S3上传", "ephemeral失败[\(http.statusCode)]: \(msg.prefix(300))")
-                        throw SunoError.uploadFailed("S3[\(http.statusCode)]: \(msg.prefix(200))")
-                    }
-                    DebugLog.shared.success("S3上传", "ephemeral上传成功 (\(http.statusCode))")
-                }
-                return
-            } catch let error as URLError where error.code == .networkConnectionLost {
-                DebugLog.shared.warn("S3上传", "ephemeral -1005，3秒后用 shared 重试...")
-                try await Task.sleep(nanoseconds: 3_000_000_000)
-            }
-
-            // 尝试 2: shared session + data(for:)
-            do {
-                let (data, resp) = try await URLSession.shared.data(for: req)
-                if let http = resp as? HTTPURLResponse {
-                    DebugLog.shared.info("S3上传", "shared响应: \(http.statusCode)")
-                    if !(200...299).contains(http.statusCode) {
-                        let msg = String(data: data, encoding: .utf8) ?? "(empty)"
-                        DebugLog.shared.error("S3上传", "shared失败[\(http.statusCode)]: \(msg.prefix(300))")
-                        throw SunoError.uploadFailed("S3[\(http.statusCode)]: \(msg.prefix(200))")
-                    }
-                    DebugLog.shared.success("S3上传", "shared重试成功 (\(http.statusCode))")
-                }
-                return
-            } catch let error as URLError where error.code == .networkConnectionLost {
-                DebugLog.shared.error("S3上传", "shared 也 -1005。两种 session 均失败，可能是 HTTP/2 兼容性问题")
-                throw SunoError.network(error)
-            }
+            DebugLog.shared.success("S3上传", "WebView上传成功 (\(status))")
         }
     }
 
@@ -349,16 +293,22 @@ struct SunoAPI {
 
     /// 拉取「我的音乐库」——当前账户所有歌曲（分页）
     /// 注意：Suno feed/v2 的 page 参数从 1 开始（非 0）
+    /// 同时发送 page 和 offset 参数 + cache-buster _t
+    /// 日志显示 page=3 返回重复数据，尝试 offset 突破限制
     func library(page: Int) async throws -> SunoFeedResponse {
         try await run {
             let safePage = max(page, 1)  // API page 从 1 开始
+            let offset = (safePage - 1) * 50  // 对应的 offset
+            let cacheBuster = String(Int(Date().timeIntervalSince1970))
             var comps = URLComponents(string: "\(SunoAPI.base)/api/feed/v2")!
             comps.queryItems = [
                 URLQueryItem(name: "page", value: String(safePage)),
-                URLQueryItem(name: "num_results", value: "50")
+                URLQueryItem(name: "offset", value: String(offset)),
+                URLQueryItem(name: "num_results", value: "50"),
+                URLQueryItem(name: "_t", value: cacheBuster)
             ]
             let req = makeRequest(comps.url!)
-            DebugLog.shared.info("音乐库", "GET /api/feed/v2?page=\(safePage)&num_results=50")
+            DebugLog.shared.info("音乐库", "GET /api/feed/v2?page=\(safePage)&offset=\(offset)&num_results=50&_t=\(cacheBuster)")
             let (data, resp) = try await URLSession.shared.data(for: req)
             if let http = resp as? HTTPURLResponse {
                 DebugLog.shared.info("音乐库", "page=\(safePage) 响应: \(http.statusCode) \(data.count)B")
