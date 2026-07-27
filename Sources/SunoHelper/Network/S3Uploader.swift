@@ -102,7 +102,7 @@ final class S3Uploader {
         }
 
         var statusCode = 0
-        if let prop = CFReadStreamCopyProperty(readStream, kCFStreamPropertyHTTPResponseHeader) {
+        if let prop = CFReadStreamCopyProperty(readStream, kCFStreamPropertyHTTPResponseHeader as CFStreamPropertyKey) {
             let responseHeader = prop.takeRetainedValue() as! CFHTTPMessage
             if CFHTTPMessageIsHeaderComplete(responseHeader) {
                 statusCode = Int(CFHTTPMessageGetResponseStatusCode(responseHeader))
