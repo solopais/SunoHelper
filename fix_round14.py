@@ -1,86 +1,160 @@
-import SwiftUI
-import Combine
+#!/usr/bin/env python3
+"""Fix SunoAPI.swift and LibraryView.swift for Round 14"""
+import os
 
-struct LibraryView: View {
-    @StateObject private var store = SongStore.shared
-    @StateObject private var session = SunoSession.shared
-    @State private var showExtend = false
-    @State private var extendClipID: String?
-    @State private var showCover = false
-    @State private var coverClipID: String?
-    @State private var refreshing = false
-    @State private var refreshMsg = ""
-    @State private var didInitialLoad = false
+os.chdir('C:/Users/22603/WorkBuddy/2026-07-23-16-41-40/SunoApp')
 
-    // === 无限滚动状态 ===
-    @State private var currentPage = 0
-    @State private var hasMorePages = true
-    @State private var loadingMore = false
-    @State private var allLoaded = false       // 已全部加载完毕
+# === 1. 修改 SunoAPI.swift ===
+filepath = 'Sources/SunoHelper/Network/SunoAPI.swift'
+with open(filepath, 'r', encoding='utf-8') as f:
+    content = f.read()
 
-    var body: some View {
-        AppNav {
-            Group {
-                if store.items.isEmpty && !refreshing && didInitialLoad {
-                    EmptyLibraryView(isLoggedIn: session.isLoggedIn)
-                } else if store.items.isEmpty && refreshing {
-                    LoadingView(message: "正在从 Suno 拉取你的音乐库…")
-                } else if store.items.isEmpty && !didInitialLoad {
-                    EmptyLibraryView(isLoggedIn: session.isLoggedIn)
-                } else {
-                    SongListContent(
-                        songs: store.items,
-                        onLoadMore: { await loadNextPage() },
-                        onRefresh: { await fullReload() },
-                        loadingMore: $loadingMore,
-                        allLoaded: $allLoaded,
-                        onExtend: { id in extendClipID = id; showExtend = true },
-                        onCover: { id in coverClipID = id; showCover = true },
-                        onDelete: { song in
-                            if let path = song.downloadedLocalPath {
-                                try? FileManager.default.removeItem(at: URL(fileURLWithPath: path))
-                            }
-                            store.remove(song)
-                        }
-                    )
-                }
+# 1a. 去掉 uploadSession 属性
+old_session = r'''    /// 专用上传 session：避免 URLSession.shared 的 keep-alive 连接复用问题（-1005）
+    private static let uploadSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.urlCache = nil
+        config.httpMaximumConnectionsPerHost = 1
+        config.timeoutIntervalForRequest = 300
+        config.timeoutIntervalForResource = 600
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: config)
+    }()
+
+    private func makeRequest'''
+
+new_session = r'''    private func makeRequest'''
+
+if old_session in content:
+    content = content.replace(old_session, new_session)
+    print("[OK] Removed uploadSession")
+else:
+    print("[WARN] uploadSession block not found")
+
+# 1b. 替换 uploadFileToS3 方法
+# 找到方法起始和结束
+upload_start = content.find(r'''    /// Step 2: 上传文件到 S3''')
+if upload_start == -1:
+    print("[ERROR] uploadFileToS3 start not found")
+else:
+    # 方法结束标记：uploadAudioOnly 的注释
+    upload_end_marker = r'''        /// 音频上传完整流程'''
+    upload_end = content.find(upload_end_marker, upload_start)
+    if upload_end == -1:
+        print("[ERROR] uploadFileToS3 end not found")
+    else:
+        new_upload = r'''    /// Step 2: 上传文件到 S3（使用预签名 URL + form fields）
+    /// 修复 -1005：ephemeral session + data(for:) + httpBody，失败后 shared session 重试
+    /// 根因：upload(for:fromFile:) + Connection:close 均无效（URLSession 覆盖 Connection header）
+    /// 新方案：用 data(for:) + httpBody 避免文件流 API 的潜在 bug，ephemeral session 避免连接复用
+    func uploadFileToS3(presignedURL: String, fields: [String: String],
+                        fileData: Data, fileName: String, mimeType: String) async throws {
+        try await run {
+            let s3URL = URL(string: presignedURL)!
+            let boundary = "Boundary-\(UUID().uuidString)"
+            let fieldsContentType = fields["Content-Type"] ?? mimeType
+
+            DebugLog.shared.info("S3上传", "fields=\(fields.keys.sorted()) CT=\(fieldsContentType) url=\(presignedURL)")
+
+            // 构造 multipart body
+            var body = Data()
+            for (key, value) in fields {
+                body.append(Data("--\(boundary)\r\n".utf8))
+                body.append(Data("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n".utf8))
+                body.append(Data("\(value)\r\n".utf8))
             }
-            .background(AppTheme.bg)
-            .navigationTitle("音乐库 (\(store.items.count))")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button(action: { Task { await fullReload() } }) {
-                        Image(systemName: "arrow.clockwise")
+            // file 字段（必须最后）
+            body.append(Data("--\(boundary)\r\n".utf8))
+            body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"upload.mp3\"\r\n".utf8))
+            body.append(Data("Content-Type: \(fieldsContentType)\r\n\r\n".utf8))
+            body.append(fileData)
+            body.append(Data("\r\n--\(boundary)--\r\n".utf8))
+
+            DebugLog.shared.info("S3上传", "body=\(body.count)B → ephemeral+data(for:)")
+
+            // 构造请求（用 httpBody 而非 upload(fromFile:)）
+            var req = URLRequest(url: s3URL)
+            req.httpMethod = "POST"
+            req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+            req.httpBody = body
+            req.timeoutInterval = 300
+
+            // 尝试 1: ephemeral session + data(for:)
+            let config = URLSessionConfiguration.ephemeral
+            config.urlCache = nil
+            config.httpMaximumConnectionsPerHost = 1
+            config.timeoutIntervalForRequest = 300
+            config.timeoutIntervalForResource = 600
+            let session = URLSession(configuration: config)
+
+            do {
+                let (data, resp) = try await session.data(for: req)
+                if let http = resp as? HTTPURLResponse {
+                    DebugLog.shared.info("S3上传", "ephemeral响应: \(http.statusCode)")
+                    if !(200...299).contains(http.statusCode) {
+                        let msg = String(data: data, encoding: .utf8) ?? "(empty)"
+                        DebugLog.shared.error("S3上传", "ephemeral失败[\(http.statusCode)]: \(msg.prefix(300))")
+                        throw SunoError.uploadFailed("S3[\(http.statusCode)]: \(msg.prefix(200))")
                     }
-                    .disabled(refreshing)
+                    DebugLog.shared.success("S3上传", "ephemeral上传成功 (\(http.statusCode))")
                 }
+                return
+            } catch let error as URLError where error.code == .networkConnectionLost {
+                DebugLog.shared.warn("S3上传", "ephemeral -1005，3秒后用 shared 重试...")
+                try await Task.sleep(nanoseconds: 3_000_000_000)
             }
-            .alert("提示", isPresented: .constant(!refreshMsg.isEmpty)) {
-                Button("好") { refreshMsg = "" }
-            } message: { Text(refreshMsg) }
-        }
-        .onAppear {
-            guard !didInitialLoad, session.isLoggedIn else { return }
-            didInitialLoad = true
-            Task { await fullReload() }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("SunoReloadLibrary"))) { _ in
-            Task { await fullReload() }
-        }
-        .sheet(isPresented: $showExtend) {
-            if let id = extendClipID {
-                GenerateView(extendClipID: id)
-            }
-        }
-        .sheet(isPresented: $showCover) {
-            if let id = coverClipID {
-                GenerateView(coverClipID: id)
+
+            // 尝试 2: shared session + data(for:)
+            do {
+                let (data, resp) = try await URLSession.shared.data(for: req)
+                if let http = resp as? HTTPURLResponse {
+                    DebugLog.shared.info("S3上传", "shared响应: \(http.statusCode)")
+                    if !(200...299).contains(http.statusCode) {
+                        let msg = String(data: data, encoding: .utf8) ?? "(empty)"
+                        DebugLog.shared.error("S3上传", "shared失败[\(http.statusCode)]: \(msg.prefix(300))")
+                        throw SunoError.uploadFailed("S3[\(http.statusCode)]: \(msg.prefix(200))")
+                    }
+                    DebugLog.shared.success("S3上传", "shared重试成功 (\(http.statusCode))")
+                }
+                return
+            } catch let error as URLError where error.code == .networkConnectionLost {
+                DebugLog.shared.error("S3上传", "shared 也 -1005。两种 session 均失败，可能是 HTTP/2 兼容性问题")
+                throw SunoError.network(error)
             }
         }
     }
 
-    /// 完全重新加载（下拉刷新 / 首次进入 / 创作完成通知）
+'''
+        content = content[:upload_start] + new_upload + content[upload_end:]
+        print("[OK] Replaced uploadFileToS3")
+
+# 1c. 修改 library 方法的日志（打印完整 URL 包括 num_results）
+old_log = r'''            DebugLog.shared.info("音乐库", "GET /api/feed/v2?page=\(safePage)")'''
+new_log = r'''            DebugLog.shared.info("音乐库", "GET /api/feed/v2?page=\(safePage)&num_results=50")'''
+if old_log in content:
+    content = content.replace(old_log, new_log)
+    print("[OK] Updated library log")
+
+with open(filepath, 'w', encoding='utf-8') as f:
+    f.write(content)
+print("[DONE] SunoAPI.swift updated")
+
+# === 2. 修改 LibraryView.swift ===
+filepath2 = 'Sources/SunoHelper/Views/LibraryView.swift'
+with open(filepath2, 'r', encoding='utf-8') as f:
+    content2 = f.read()
+
+# 2a. 替换 fullReload 方法
+old_fullreload_start = r'''    /// 完全重新加载（下拉刷新 / 首次进入 / 创作完成通知）'''
+old_fullreload_end = r'''    /// 后台预加载剩余页面'''
+
+fr_start = content2.find(old_fullreload_start)
+fr_end = content2.find(old_fullreload_end)
+
+if fr_start == -1 or fr_end == -1:
+    print("[ERROR] fullReload boundaries not found")
+else:
+    new_fullreload = r'''    /// 完全重新加载（下拉刷新 / 首次进入 / 创作完成通知）
     /// 策略：先加载第 1 页立即展示，然后后台渐进式加载剩余页面
     /// 重要：不再依赖 has_more（API 返回 has_more=false 但 num_total=1571，矛盾）
     ///       改为根据 num_total_results 和已加载数量判断是否继续翻页
@@ -186,7 +260,21 @@ struct LibraryView: View {
         }
     }
 
-    /// 后台预加载剩余页面（用户可同时浏览已加载的歌曲）
+'''
+    content2 = content2[:fr_start] + new_fullreload + content2[fr_end:]
+    print("[OK] Replaced fullReload")
+
+# 2b. 替换 preloadRemaining 方法
+old_preload_start = r'''    /// 后台预加载剩余页面'''
+old_preload_end = r'''    /// 加载下一页'''
+
+pr_start = content2.find(old_preload_start)
+pr_end = content2.find(old_preload_end)
+
+if pr_start == -1 or pr_end == -1:
+    print("[ERROR] preloadRemaining boundaries not found")
+else:
+    new_preload = r'''    /// 后台预加载剩余页面（用户可同时浏览已加载的歌曲）
     /// 不再依赖 has_more，根据 num_total_results 和已加载数量判断
     /// 加去重逻辑：如果返回歌曲全部重复，说明分页不工作，停止加载
     func preloadRemaining() async {
@@ -263,7 +351,21 @@ struct LibraryView: View {
         await MainActor.run { loadingMore = false; allLoaded = true }
     }
 
-    /// 加载下一页（无限滚动触发）
+'''
+    content2 = content2[:pr_start] + new_preload + content2[pr_end:]
+    print("[OK] Replaced preloadRemaining")
+
+# 2c. 替换 loadNextPage 方法
+old_loadnext_start = r'''    /// 加载下一页（无限滚动触发）'''
+old_loadnext_end = r'''}\n\n// MARK: - 空态视图'''
+
+ln_start = content2.find(old_loadnext_start)
+ln_end = content2.find(r'''// MARK: - 空态视图''')
+
+if ln_start == -1 or ln_end == -1:
+    print("[ERROR] loadNextPage boundaries not found")
+else:
+    new_loadnext = r'''    /// 加载下一页（无限滚动触发）
     /// 不再依赖 has_more，根据 num_total_results 和已加载数量判断
     func loadNextPage() async {
         guard !loadingMore, !allLoaded, hasMorePages, session.isLoggedIn else { return }
@@ -309,104 +411,14 @@ struct LibraryView: View {
 
         await MainActor.run { loadingMore = false }
     }
-}
 
-// MARK: - 空态视图
-private struct EmptyLibraryView: View {
-    let isLoggedIn: Bool
+'''
+    # 找到 loadNextPage 结束位置（在 // MARK: - 空态视图 之前）
+    ln_end_pos = content2.find(r'''// MARK: - 空态视图''')
+    if ln_end_pos != -1:
+        content2 = content2[:ln_start] + new_loadnext + '\n' + content2[ln_end_pos:]
+        print("[OK] Replaced loadNextPage")
 
-    var body: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "music.note.list")
-                .font(.system(size: 42))
-                .foregroundColor(AppTheme.surface2)
-            Text(isLoggedIn ? "音乐库是空的" : "请先登录 Suno 账户")
-                .foregroundColor(AppTheme.textSecondary)
-            Text(isLoggedIn ? "下拉刷新，或去「创作」生成新歌" : "登录后可查看你在 Suno 的所有作品")
-                .font(.caption)
-                .foregroundColor(AppTheme.textSecondary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
-
-// MARK: - 加载中视图
-private struct LoadingView: View {
-    let message: String
-
-    var body: some View {
-        VStack(spacing: 12) {
-            ProgressView().tint(AppTheme.accent).scaleEffect(1.2)
-            Text(message)
-                .font(.caption).foregroundColor(AppTheme.textSecondary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
-
-// MARK: - 歌曲列表 + 无限滚动
-private struct SongListContent: View {
-    let songs: [Song]
-    let onLoadMore: () async -> Void
-    let onRefresh: () async -> Void
-    @Binding var loadingMore: Bool
-    @Binding var allLoaded: Bool
-    let onExtend: (String) -> Void
-    let onCover: (String) -> Void
-    let onDelete: (Song) -> Void
-
-    var body: some View {
-        List {
-            ForEach(songs) { song in
-                SongCard(song: song) {
-                    onExtend(song.id)
-                } onCover: {
-                    onCover(song.id)
-                }
-                .listRowSeparator(.hidden)
-                .listRowBackground(Color.clear)
-                .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
-                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                    Button(role: .destructive) { onDelete(song) } label: {
-                        Label("删除", systemImage: "trash")
-                    }
-                }
-                // 无限滚动触发：接近列表底部时加载更多
-                .onAppear {
-                    if shouldTriggerLoadMore(for: song) {
-                        Task { await onLoadMore() }
-                    }
-                }
-            }
-
-            // 底部加载指示器
-            if loadingMore {
-                HStack(spacing: 10) {
-                    ProgressView().tint(AppTheme.accent).scaleEffect(0.8)
-                    Text("正在加载更多…").font(.caption).foregroundColor(AppTheme.textSecondary)
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 16)
-                .listRowSeparator(.hidden)
-                .listRowBackground(Color.clear)
-            } else if allLoaded && !songs.isEmpty {
-                Text("— 已全部加载 —")
-                    .font(.caption).foregroundColor(AppTheme.textSecondary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-                    .listRowSeparator(.hidden)
-                    .listRowBackground(Color.clear)
-            }
-        }
-        .listStyle(.plain)
-        .hideScrollContentBackground()
-        .refreshable { await onRefresh() }
-    }
-
-    /// 判断是否应该触发加载更多（列表倒数第 3 个 item 时触发）
-    func shouldTriggerLoadMore(for song: Song) -> Bool {
-        guard !loadingMore, !allLoaded else { return false }
-        guard let idx = songs.firstIndex(where: { $0.id == song.id }) else { return false }
-        return idx >= songs.count - 3
-    }
-}
+with open(filepath2, 'w', encoding='utf-8') as f:
+    f.write(content2)
+print("[DONE] LibraryView.swift updated")
