@@ -119,6 +119,10 @@ struct GenerateView: View {
                             showAdvancedOptions: $showAdvancedOptions,
                             planType: planType,
                             onPickAudio: { showAudioPicker = true },
+                            onClearAudio: {
+                                pickedAudioURL = nil
+                                pickedAudioName = nil
+                            },
                             pickedAudioName: pickedAudioName
                         )
                     }
@@ -386,6 +390,7 @@ private struct AdvancedModeSection: View {
     @Binding var showAdvancedOptions: Bool
     var planType: SunoPlanType = .unknown
     var onPickAudio: (() -> Void)? = nil
+    var onClearAudio: (() -> Void)? = nil
     var pickedAudioName: String? = nil
 
     /// 免费版是否锁定高级参数（怪异/风格影响固定 50%）
@@ -413,10 +418,7 @@ private struct AdvancedModeSection: View {
                     Image(systemName: "doc.fill").font(.caption).foregroundColor(AppTheme.accent)
                     Text(name)
                         .font(.caption).foregroundColor(AppTheme.textSecondary).lineLimit(1)
-                    Button(action: {
-                        pickedAudioURL = nil
-                        pickedAudioName = nil
-                    }) {
+                    Button(action: { onClearAudio?() }) {
                         Image(systemName: "xmark.circle.fill").font(.caption).foregroundColor(AppTheme.textSecondary)
                     }
                 }
