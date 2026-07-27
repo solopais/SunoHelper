@@ -25,7 +25,7 @@ struct Song: Codable, Identifiable {
 
     static func from(clip: SunoClip) -> Song {
         let meta = clip.metadata
-        let title = (clip.title.isEmpty ? (meta?.gpt_description_prompt ?? "") : clip.title)
+        let title = (clip.title?.isEmpty == true ? (meta?.gpt_description_prompt ?? "") : (clip.title ?? meta?.gpt_description_prompt ?? ""))
         return Song(
             id: clip.id,
             title: title,
