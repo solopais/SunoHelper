@@ -130,33 +130,49 @@ struct SunoAPI {
         try await run {
             let s3URL = URL(string: presignedURL)!
             let boundary = "Boundary-\(UUID().uuidString)"
+
+            // 构造 multipart body（和之前一样，但先写进临时文件）
             var body = Data()
-
-            // 先添加所有 S3 表单字段
             for (key, value) in fields {
-                body.append(Data("--\(boundary)\r\n".utf8))
-                body.append(Data("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n".utf8))
-                body.append(Data("\(value)\r\n".utf8))
+                body.append(Data("--\(boundary)
+".utf8))
+                body.append(Data("Content-Disposition: form-data; name=\"\(key)\"
+
+".utf8))
+                body.append(Data("\(value)
+".utf8))
             }
-
-            // 再添加文件字段
-            let safeName = encodedFileName(fileName)
-            body.append(Data("--\(boundary)\r\n".utf8))
-            body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"\(safeName)\"\r\n".utf8))
-            body.append(Data("Content-Type: \(mimeType)\r\n\r\n".utf8))
+            // 文件字段：文件名用 ASCII 临时名，避免中文编码问题
+            body.append(Data("--\(boundary)
+".utf8))
+            body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"upload.mp3\"
+".utf8))
+            body.append(Data("Content-Type: \(mimeType)
+
+".utf8))
             body.append(fileData)
-            body.append(Data("\r\n--\(boundary)--\r\n".utf8))
+            body.append(Data("
+--\(boundary)--
+".utf8))
+
+            // 写入临时文件（URLSession.upload 从文件流传输，大文件稳定）
+            let tempDir = FileManager.default.temporaryDirectory
+            let tempFile = tempDir.appendingPathComponent("suno_upload_\(UUID().uuidString).tmp")
+            try body.write(to: tempFile)
+            defer {
+                try? FileManager.default.removeItem(at: tempFile)
+            }
 
             var req = URLRequest(url: s3URL)
             req.httpMethod = "POST"
             req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-            // 不手动设 Content-Length！URLSession 用 httpBody 时自动计算，
-            // 手动设会导致重复 header → S3 reset 连接 → "网络连接已中断"
-            req.httpBody = body
             req.timeoutInterval = 300  // 大文件给 5 分钟
 
-            DebugLog.shared.info("S3上传", "POST \(presignedURL.prefix(60))... body=\(body.count)B")
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            DebugLog.shared.info("S3上传", "POST \(presignedURL.prefix(60))... body=\(body.count)B → 临时文件流传输")
+
+            // 用 upload(for:fromFile:) 代替 data(for:)，大文件不走内存
+            let (data, resp) = try await URLSession.shared.upload(for: req, fromFile: tempFile)
+
             if let http = resp as? HTTPURLResponse {
                 DebugLog.shared.info("S3上传", "响应状态: \(http.statusCode)")
                 if !(200...299).contains(http.statusCode) {
@@ -168,7 +184,6 @@ struct SunoAPI {
             }
         }
     }
-
     /// 音频上传完整流程（Step 1 + Step 2），返回上传结果供后续 generate/cover 使用
     /// 这是新入口：替代旧的直接 multipart 到 generate 的错误方式
     func uploadAudioOnly(fileData: Data, fileName: String) async throws -> AudioUploadResult {
@@ -318,7 +333,8 @@ struct SunoAPI {
             let safePage = max(page, 1)  // API page 从 1 开始
             var comps = URLComponents(string: "\(SunoAPI.base)/api/feed/v2")!
             comps.queryItems = [
-                URLQueryItem(name: "page", value: String(safePage))
+                URLQueryItem(name: "page", value: String(safePage)),
+                URLQueryItem(name: "num_results", value: "20")
             ]
             let req = makeRequest(comps.url!)
             DebugLog.shared.info("音乐库", "GET /api/feed/v2?page=\(safePage)")
@@ -328,7 +344,8 @@ struct SunoAPI {
             }
             try Self.check(resp: resp, data: data)
             if let wrapped = try? JSONDecoder().decode(SunoFeedResponse.self, from: data) {
-                DebugLog.shared.info("音乐库", "page=\(safePage) clips=\(wrapped.clips.count) has_more=\(wrapped.has_more ?? false)")
+                let titles = wrapped.clips.prefix(3).compactMap { "[\($0.title ?? "?") \($0.created_at ?? "")]" }.joined(separator: ", ")
+                DebugLog.shared.info("音乐库", "page=\(safePage) clips=\(wrapped.clips.count) has_more=\(wrapped.has_more ?? false) top3=\(titles)")
                 return wrapped
             }
             let arr = Self.decodeClips(data)
