@@ -96,7 +96,7 @@ struct SongCard: View {
                 }
                 .disabled(song.audioURL == nil)
 
-                compactAction(icon: "waveform.badge.mic", label: "Cover") {
+                compactAction(icon: "waveform.badge.mic", label: "翻唱") {
                     onCover()
                 }
                 .disabled(song.audioURL == nil)

@@ -186,7 +186,8 @@ struct GeneratePayload: Encodable {
     var make_instrumental: Bool = false
     var mv: String = SunoModels.defaultMV
     var prompt: String = ""                    // 自定义模式：歌词文本
-    var generation_type: String = "TEXT"        // TEXT / AUDIO_UPLOAD / CONTINUE 等
+    var generation_type: String = "TEXT"        // TEXT / AUDIO_UPLOAD / COVER 等
+    var input: String = "TEXT"                 // TEXT / AUDIO / IMAGE / VIDEO / TWITTER / SIMPLE_REMIX（API 必填校验）
     var gpt_description_prompt: String? = nil   // 简单/灵感模式提示词（≤200字）
     var tags: String? = nil                     // 风格标签（逗号分隔）
     var title: String? = nil                    // 歌曲标题
@@ -252,6 +253,7 @@ struct GeneratePayload: Encodable {
         p.continue_clip_id = clipId
         p.task = "cover"
         p.generation_type = "COVER"
+        p.input = "AUDIO"   // 翻唱基于已有音频 clip
         return p
     }
 }

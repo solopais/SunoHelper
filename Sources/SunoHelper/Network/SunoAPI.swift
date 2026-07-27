@@ -55,15 +55,10 @@ struct SunoAPI {
         }
     }
 
-    /// 音频上传 + 生成一体接口（multipart/form-data）
-    /// Suno 的 AUDIO_UPLOAD 模式需要将音频文件以 multipart 形式提交到生成端点
-    func generateWithAudio(fileURL: URL, payload: GeneratePayload) async throws -> [SunoClipStub] {
+    /// 音频上传 + 生成一体接口（multipart/form-data）— 接受预读取的 Data，避免沙盒权限过期
+    func generateWithAudioData(fileData: Data, fileName: String, payload: GeneratePayload) async throws -> [SunoClipStub] {
         try await run {
             let apiURL = URL(string: "\(SunoAPI.base)/api/generate/v2/")!
-
-            // 读取音频文件数据
-            let fileData = try Data(contentsOf: fileURL)
-            let fileName = fileURL.lastPathComponent
             let mimeType = mimeTypeForAudio(fileName)
 
             // 构建 multipart/form-data body
@@ -75,6 +70,7 @@ struct SunoAPI {
                 ("make_instrumental", "\(payload.make_instrumental)"),
                 ("mv", payload.mv),
                 ("generation_type", "AUDIO_UPLOAD"),
+                ("input", payload.input),
                 ("prompt", payload.prompt.isEmpty ? nil : payload.prompt),
                 ("gpt_description_prompt", payload.gpt_description_prompt),
                 ("tags", payload.tags),
@@ -123,6 +119,12 @@ struct SunoAPI {
             let decoded = try JSONDecoder().decode(GenerateResponse.self, from: data)
             return decoded.clips
         }
+    }
+
+    /// 音频上传 + 生成一体接口（multipart/form-data）— 从文件 URL 读取（兼容旧调用）
+    func generateWithAudio(fileURL: URL, payload: GeneratePayload) async throws -> [SunoClipStub] {
+        let fileData = try Data(contentsOf: fileURL)
+        return try await generateWithAudioData(fileData: fileData, fileName: fileURL.lastPathComponent, payload: payload)
     }
 
     /// 根据文件扩展名推断 MIME 类型

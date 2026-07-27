@@ -32,6 +32,7 @@ struct LibraryView: View {
                     SongListContent(
                         songs: store.items,
                         onLoadMore: { await loadNextPage() },
+                        onRefresh: { await fullReload() },
                         loadingMore: $loadingMore,
                         allLoaded: $allLoaded,
                         onExtend: { id in extendClipID = id; showExtend = true },
@@ -98,7 +99,7 @@ struct LibraryView: View {
             let resp = try await SunoAPI.shared.library(page: 1)
             let songs = resp.clips.map { Song.from(clip: $0) }
             await MainActor.run {
-                store.mergeRemote(songs)
+                store.replaceRemote(songs)   // fullReload 先清空再写入，避免旧缓存导致数量不准
                 currentPage = 2       // page=1 已加载，下一页从 2 开始
                 hasMorePages = resp.has_more == true
                 allLoaded = !hasMorePages
@@ -128,9 +129,8 @@ struct LibraryView: View {
                 totalCount = resp.num_total_results
             }
         } catch {
-            await MainActor.run {
-                allLoaded = true  // 出错也停止，避免死循环
-            }
+            // 单页加载失败不终止分页，下次滚动到底部会重试
+            await MainActor.run { refreshMsg = "加载更多失败，稍后重试：\(error.localizedDescription)" }
         }
 
         await MainActor.run { loadingMore = false }
@@ -174,6 +174,7 @@ private struct LoadingView: View {
 private struct SongListContent: View {
     let songs: [Song]
     let onLoadMore: () async -> Void
+    let onRefresh: () async -> Void
     @Binding var loadingMore: Bool
     @Binding var allLoaded: Bool
     let onExtend: (String) -> Void
@@ -225,7 +226,7 @@ private struct SongListContent: View {
         }
         .listStyle(.plain)
         .hideScrollContentBackground()
-        .refreshable { await onLoadMore() }
+        .refreshable { await onRefresh() }
     }
 
     /// 判断是否应该触发加载更多（列表倒数第 3 个 item 时触发）

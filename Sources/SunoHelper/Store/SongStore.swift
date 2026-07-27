@@ -45,6 +45,12 @@ final class SongStore: ObservableObject {
         }
     }
 
+    /// 替换本地音乐库（fullReload 用：先清空再写入服务端数据）
+    func replaceRemote(_ remote: [Song]) {
+        items = remote
+        save()
+    }
+
     /// 合并从 Suno 拉回的音乐库（保留本地已下载路径），按创建时间倒序
     func mergeRemote(_ remote: [Song]) {
         for r in remote {

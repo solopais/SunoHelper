@@ -32,8 +32,9 @@ struct GenerateView: View {
     @State private var showWebViewCreate = false
     @State private var captchaBlocked = false
     @State private var showAudioPicker = false       // 音频文件选择器
-    @State private var pickedAudioURL: URL?          // 已选音频文件路径
+    @State private var pickedAudioURL: URL?          // 已选音频文件路径（bookmark 用）
     @State private var pickedAudioName: String?      // 已选音频文件名
+    @State private var pickedAudioData: Data?        // 已选音频文件数据（选择时立即读取，避免沙盒权限过期）
 
     // === 续写模式 ===
     private let extendClipID: String?
@@ -122,6 +123,7 @@ struct GenerateView: View {
                             onClearAudio: {
                                 pickedAudioURL = nil
                                 pickedAudioName = nil
+                                pickedAudioData = nil
                             },
                             pickedAudioName: pickedAudioName
                         )
@@ -206,10 +208,17 @@ struct GenerateView: View {
                 switch result {
                 case .success(let urls):
                     if let url = urls.first {
-                        pickedAudioURL = url
-                        pickedAudioName = url.lastPathComponent
-                        // 切换到自定义模式（音频上传需要用 prompt/generation_type=AUDIO_UPLOAD）
-                        createMode = .advanced
+                        // 立即读取文件数据（security-scoped URL 仅在选择回调期间有效）
+                        let accessed = url.startAccessingSecurityScopedResource()
+                        defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+                        if let data = try? Data(contentsOf: url) {
+                            pickedAudioData = data
+                            pickedAudioURL = url
+                            pickedAudioName = url.lastPathComponent
+                            createMode = .advanced
+                        } else {
+                            message = "❌ 无法读取音频文件，请重试"
+                        }
                     }
                 case .failure(let err):
                     message = "选择文件失败：\(err.localizedDescription)"
@@ -220,7 +229,7 @@ struct GenerateView: View {
     }
 
     var navTitle: String {
-        if coverClipID != nil { return "Cover 翻唱" }
+        if coverClipID != nil { return "翻唱" }
         if extendClipID != nil { return "续写歌曲" }
         return "创作"
     }
@@ -282,19 +291,20 @@ struct GenerateView: View {
             return
         }
         busy = true
-        message = pickedAudioURL != nil ? "正在上传音频并提交创作任务…" : "提交创作任务…"
+        message = pickedAudioData != nil ? "正在上传音频并提交创作任务…" : "提交创作任务…"
         captchaBlocked = false
 
         Task {
             do {
                 let stubs: [SunoClipStub]
 
-                // 如果选择了音频文件，走 multipart 上传路径
-                if let audioURL = pickedAudioURL {
+                // 如果选择了音频文件，走 multipart 上传路径（用预读取的 Data 避免沙盒权限过期）
+                if let audioData = pickedAudioData, let audioURL = pickedAudioURL {
                     message = "正在上传音频并提交创作任务…"
                     var audioPayload = buildPayload()
                     audioPayload.generation_type = "AUDIO_UPLOAD"
-                    stubs = try await SunoAPI.shared.generateWithAudio(fileURL: audioURL, payload: audioPayload)
+                    audioPayload.input = "AUDIO"
+                    stubs = try await SunoAPI.shared.generateWithAudioData(fileData: audioData, fileName: audioURL.lastPathComponent, payload: audioPayload)
                 } else {
                     stubs = try await SunoAPI.shared.generate(payload: buildPayload())
                 }
@@ -348,6 +358,7 @@ struct GenerateView: View {
         prompt = ""; tags = ""; title = ""; extendNote = ""
         negativeTags = ""; vocalGender = nil
         weirdness = 50; styleWeight = 50
+        pickedAudioURL = nil; pickedAudioName = nil; pickedAudioData = nil
     }
 }
 
@@ -581,12 +592,12 @@ private struct 续写Header: View {
     }
 }
 
-// MARK: - Cover 头部
+// MARK: - 翻唱头部
 private struct CoverHeader: View {
     let clipId: String
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Label("Cover 翻唱模式", systemImage: "waveform.badge.mic")
+            Label("翻唱模式", systemImage: "waveform.badge.mic")
                 .font(.headline).foregroundColor(AppTheme.accent)
             Text("基于已选歌曲重新生成（保留原曲结构，可换风格/模型）\nid: \(clipId.prefix(8))…")
                 .font(.caption).foregroundColor(AppTheme.textSecondary)
