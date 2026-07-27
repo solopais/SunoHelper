@@ -292,24 +292,33 @@ struct SunoAPI {
     }
 
     /// 拉取「我的音乐库」——当前账户所有歌曲（分页）
-    /// 注意：Suno feed/v2 的 page 参数从 1 开始（非 0）
-    /// 同时发送 page 和 offset 参数 + cache-buster _t + sort=newest
-    /// 修复：API 默认排序不是时间倒序，导致新歌不在 page=1，加 sort=newest 强制按时间倒序
+    /// 关键发现（2026-07-28 用 cookie 实测 API 确认）：
+    ///   - 带 page 参数 → API 走缓存路径，返回旧数据（新创作的歌不在里面）
+    ///   - 不带 page 参数 → API 返回最新数据（含刚创作的歌），current_page=0
+    /// 解决方案：page=1 时不发 page 参数（拿最新），page>1 时带 page 参数（翻历史）
     func library(page: Int) async throws -> SunoFeedResponse {
         try await run {
-            let safePage = max(page, 1)  // API page 从 1 开始
-            let offset = (safePage - 1) * 50  // 对应的 offset
+            let safePage = max(page, 1)
             let cacheBuster = String(Int(Date().timeIntervalSince1970))
             var comps = URLComponents(string: "\(SunoAPI.base)/api/feed/v2")!
-            comps.queryItems = [
-                URLQueryItem(name: "page", value: String(safePage)),
-                URLQueryItem(name: "offset", value: String(offset)),
-                URLQueryItem(name: "num_results", value: "50"),
-                URLQueryItem(name: "sort", value: "newest"),
-                URLQueryItem(name: "_t", value: cacheBuster)
-            ]
+            if safePage == 1 {
+                // 首页：不带 page 参数，获取最新数据（含刚创作的歌曲）
+                comps.queryItems = [
+                    URLQueryItem(name: "num_results", value: "50"),
+                    URLQueryItem(name: "_t", value: cacheBuster)
+                ]
+            } else {
+                // 后续页：带 page 参数，获取历史库
+                comps.queryItems = [
+                    URLQueryItem(name: "page", value: String(safePage)),
+                    URLQueryItem(name: "num_results", value: "50"),
+                    URLQueryItem(name: "_t", value: cacheBuster)
+                ]
+            }
             let req = makeRequest(comps.url!)
-            DebugLog.shared.info("音乐库", "GET /api/feed/v2?page=\(safePage)&offset=\(offset)&num_results=50&sort=newest&_t=\(cacheBuster)")
+            let urlStr = comps.url!.absoluteString
+            let shortUrl = String(urlStr.suffix(80))
+            DebugLog.shared.info("音乐库", "GET .../\(shortUrl)")
             let (data, resp) = try await URLSession.shared.data(for: req)
             if let http = resp as? HTTPURLResponse {
                 DebugLog.shared.info("音乐库", "page=\(safePage) 响应: \(http.statusCode) \(data.count)B")
