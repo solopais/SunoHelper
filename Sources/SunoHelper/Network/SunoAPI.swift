@@ -59,10 +59,10 @@ struct SunoAPI {
     /// Suno 的 AUDIO_UPLOAD 模式需要将音频文件以 multipart 形式提交到生成端点
     func generateWithAudio(fileURL: URL, payload: GeneratePayload) async throws -> [SunoClipStub] {
         try await run {
-            let url = URL(string: "\(SunoAPI.base)/api/generate/v2/")!
+            let apiURL = URL(string: "\(SunoAPI.base)/api/generate/v2/")!
 
             // 读取音频文件数据
-            let fileData = try Data(contentsOf: url)
+            let fileData = try Data(contentsOf: fileURL)
             let fileName = fileURL.lastPathComponent
             let mimeType = mimeTypeForAudio(fileName)
 
@@ -107,7 +107,7 @@ struct SunoAPI {
             body.append("--\(boundary)--\r\n")
 
             // 构建请求
-            var req = URLRequest(url: url)
+            var req = URLRequest(url: apiURL)
             req.httpMethod = "POST"
             req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
             req.setValue("https://suno.com/", forHTTPHeaderField: "Referer")
@@ -127,7 +127,7 @@ struct SunoAPI {
 
     /// 根据文件扩展名推断 MIME 类型
     private func mimeTypeForAudio(_ fileName: String) -> String {
-        let ext = fileName.pathExtension.lowercased()
+        let ext = (fileName as NSString).pathExtension.lowercased()
         switch ext {
         case "mp3": return "audio/mpeg"
         case "wav": return "audio/wav"
