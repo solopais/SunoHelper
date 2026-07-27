@@ -291,32 +291,50 @@ struct GenerateView: View {
             return
         }
         busy = true
-        message = pickedAudioData != nil ? "正在上传音频并提交创作任务…" : "提交创作任务…"
+        message = pickedAudioData != nil ? "正在上传音频到 Suno 音乐库…" : "提交创作任务…"
         captchaBlocked = false
 
         Task {
             do {
                 let stubs: [SunoClipStub]
 
-                // 如果选择了音频文件，走 S3 两步上传流程（先上传到 Suno S3，再用 URL 提交生成）
+                // 如果选择了音频文件，走"纯上传到音乐库"流程
+                // 用户明确要求：上传音频 → 进入音乐库 → 在音乐库点击翻唱
+                // 不是上传后直接生成
                 if let audioData = pickedAudioData, let audioURL = pickedAudioURL {
-                    // Step 1+2: 上传音频到 Suno S3（获取预签名 URL → POST 文件）
-                    message = "正在上传音频到 Suno（1/2）…"
+                    // Step 1+2: 上传到 S3
+                    message = "正在上传音频到 Suno（1/3）…"
                     let uploadResult = try await SunoAPI.shared.uploadAudioOnly(
                         fileData: audioData,
                         fileName: audioURL.lastPathComponent
                     )
 
-                    // Step 3: 用上传后的 URL 提交创作/翻唱任务
-                    message = "音频上传成功，提交创作任务（2/2）…"
-                    var audioPayload = buildPayload()
-                    audioPayload.generation_type = "AUDIO"
-                    audioPayload.prompt = uploadResult.audioUrl  // AUDIO 模式：prompt 传音频 CDN URL
-                    audioPayload.audio_url = uploadResult.audioUrl  // 双保险：部分 API 版本用此字段
-                    stubs = try await SunoAPI.shared.generate(payload: audioPayload)
-                } else {
-                    stubs = try await SunoAPI.shared.generate(payload: buildPayload())
+                    // Step 3: 轮询处理状态（Suno 后端需要时间分析音频）
+                    message = "音频已上传，等待 Suno 处理（2/3）…"
+                    var processingRounds = 0
+                    var uploadStatus: AudioUploadStatus
+                    repeat {
+                        try await Task.sleep(nanoseconds: 3_000_000_000)
+                        processingRounds += 1
+                        uploadStatus = try await SunoAPI.shared.pollUploadStatus(uploadId: uploadResult.uploadId)
+                        await MainActor.run {
+                            message = "Suno 处理中（\(processingRounds * 3)s）…状态：\(uploadStatus.status ?? "unknown")"
+                        }
+                    } while uploadStatus.status == "processing" && processingRounds < 60  // 最长 3 分钟
+
+                    // 处理完成，刷新音乐库
+                    await MainActor.run {
+                        message = "✅ 音频上传成功！已加入音乐库，可点击「翻唱」进行改编"
+                        busy = false
+                        resetForm()
+                        // 通知音乐库刷新，用户能看到新上传的歌曲
+                        NotificationCenter.default.post(name: Notification.Name("SunoReloadLibrary"), object: nil)
+                    }
+                    return  // 上传流程结束，不走下面的生成流程
                 }
+
+                // 正常生成流程（非音频上传）
+                stubs = try await SunoAPI.shared.generate(payload: buildPayload())
                 let ids = stubs.map { $0.id }
                 await MainActor.run { message = "已提交，Suno 创作中（\(ids.count) 首）…轮询进度中…" }
 
@@ -328,22 +346,20 @@ struct GenerateView: View {
                     try await Task.sleep(nanoseconds: 4_000_000_000)
                     rounds += 1
 
-                    // 单次 feed 查询失败仅记录，不终止轮询（网络抖动/临时 401 不应杀死整个任务）
                     do {
                         let clips = try await SunoAPI.shared.feed(ids: ids)
-                        consecutiveErrors = 0             // 成功则重置错误计数
+                        consecutiveErrors = 0
                         for c in clips {
                             await MainActor.run { store.update(Song.from(clip: c)) }
                         }
                         finished = clips.allSatisfy { ($0.status ?? "streaming") == "complete" || ($0.status ?? "") == "error" }
                     } catch {
                         consecutiveErrors += 1
-                        // 连续 5 次失败才放弃（避免死循环），否则继续等下次重试
                         guard consecutiveErrors >= 5 else {
                             await MainActor.run { message = "轮询中…(\(rounds) \(consecutiveErrors)次暂失败，继续等待)" }
                             continue
                         }
-                        throw error   // 连续多次失败，抛出给外层 catch
+                        throw error
                     }
 
                     await MainActor.run { message = finished ? "✅ 创作完成！" : "创作中…(\(rounds)×4s)" }
@@ -357,7 +373,6 @@ struct GenerateView: View {
                     } else {
                         message = "仍在创作中，可到「音乐库」等待或下拉刷新"
                     }
-                    // 无论成功/超时都通知音乐库刷新（新歌曲可能已在服务端完成）
                     NotificationCenter.default.post(name: Notification.Name("SunoReloadLibrary"), object: nil)
                 }
             } catch {
@@ -367,7 +382,6 @@ struct GenerateView: View {
                     if let se = error as? SunoError, case .captcha = se {
                         captchaBlocked = true
                     }
-                    // 即使失败也尝试刷新音乐库（部分歌曲可能已提交成功）
                     NotificationCenter.default.post(name: Notification.Name("SunoReloadLibrary"), object: nil)
                 }
             }

@@ -41,6 +41,15 @@ struct AudioUploadResult {
     let audioUrl: String           // 文件在 Suno CDN/S3 的最终 URL（由 id 拼接）
 }
 
+/// GET /api/uploads/audio/{id}/ 的响应（上传后轮询处理状态用）
+struct AudioUploadStatus: Decodable {
+    let id: String
+    let status: String?          // "processing" → "complete" / "error"
+    let title: String?
+    let audio_url: String?       // 处理完成后可能返回真实 CDN URL
+    let copyright_muted: Bool?
+}
+
 /// Suno 网页内部 API 客户端（cookie 认证，非官方但免费账户可用）
 struct SunoAPI {
     static let base = "https://studio-api.prod.suno.com"
@@ -168,6 +177,40 @@ struct SunoAPI {
         // 构造结果：audioUrl 由 id 拼接（Suno CDN 格式）
         let audioUrl = "https://cdn1.suno.ai/\(uploadReq.id).\(ext.isEmpty ? "mp3" : ext)"
         return AudioUploadResult(uploadId: uploadReq.id, audioUrl: audioUrl)
+    }
+
+    /// Step 3: 轮询上传处理状态（S3 上传成功后，Suno 后端需要时间处理音频）
+    /// 返回处理完成后的状态信息（status != "processing"）
+    func pollUploadStatus(uploadId: String) async throws -> AudioUploadStatus {
+        try await run {
+            let url = URL(string: "\(SunoAPI.base)/api/uploads/audio/\(uploadId)/")!
+            let req = makeRequest(url)
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            try Self.check(resp: resp, data: data)
+            return try JSONDecoder().decode(AudioUploadStatus.self, from: data)
+        }
+    }
+
+    /// 完整上传流程：上传到 S3 → 轮询处理状态直到完成（最长 3 分钟）
+    /// 处理完成后返回 AudioUploadStatus（含真实 audio_url 和 title）
+    func uploadAndWaitForProcessing(fileData: Data, fileName: String) async throws -> AudioUploadStatus {
+        // Step 1+2: 上传到 S3
+        let uploadResult = try await uploadAudioOnly(fileData: fileData, fileName: fileName)
+
+        // Step 3: 轮询处理状态（每 3 秒查一次，最长 3 分钟）
+        var rounds = 0
+        let maxRounds = 60  // 60 × 3s = 180s = 3 分钟
+        while rounds < maxRounds {
+            try await Task.sleep(nanoseconds: 3_000_000_000)
+            rounds += 1
+            let status = try await pollUploadStatus(uploadId: uploadResult.uploadId)
+            if status.status != "processing" {
+                return status  // 处理完成（成功或失败）
+            }
+        }
+        // 超时：返回当前状态（可能仍在处理中）
+        return AudioUploadStatus(id: uploadResult.uploadId, status: "processing",
+                                  title: nil, audio_url: uploadResult.audioUrl, copyright_muted: nil)
     }
 
     /// 旧接口兼容（内部不再使用，保留避免编译报错）
@@ -300,8 +343,16 @@ struct SunoAPI {
 
     private static func check(resp: URLResponse, data: Data) throws {
         guard let http = resp as? HTTPURLResponse else { return }
-        if http.statusCode == 401 || http.statusCode == 403 {
+        if http.statusCode == 401 {
             throw SunoError.authExpired
+        }
+        if http.statusCode == 403 {
+            let msg = String(data: data, encoding: .utf8) ?? ""
+            // 区分"登录过期"和"模型权限不足"
+            if msg.contains("don't have access") || msg.contains("Upgrade your plan") {
+                throw SunoError.http(403, msg)  // 模型权限不足，不是登录问题
+            }
+            throw SunoError.authExpired  // 其他 403 视为登录过期
         }
         if http.statusCode == 422 {
             let msg = String(data: data, encoding: .utf8) ?? ""

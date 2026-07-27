@@ -17,7 +17,6 @@ struct LibraryView: View {
     @State private var hasMorePages = true
     @State private var loadingMore = false
     @State private var allLoaded = false       // 已全部加载完毕
-    @State private var totalCount: Int? = nil   // 总数（来自 API）
 
     var body: some View {
         AppNav {
@@ -47,7 +46,7 @@ struct LibraryView: View {
                 }
             }
             .background(AppTheme.bg)
-            .navigationTitle(totalCount != nil ? "音乐库 (\(totalCount!))" : "音乐库")
+            .navigationTitle("音乐库 (\(store.items.count))")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
@@ -83,6 +82,8 @@ struct LibraryView: View {
 
     /// 完全重新加载（下拉刷新 / 首次进入 / 创作完成通知）
     /// 策略：先加载第 1 页立即展示，然后后台渐进式加载剩余页面
+    /// 注意：Suno API 的 num_total_results 始终返回 21（不可靠），不能用来判断总数！
+    ///       只能依赖 has_more + clips 是否为空来判断是否还有更多数据
     func fullReload() async {
         guard session.isLoggedIn else {
             await MainActor.run { refreshMsg = "请先登录 Suno 账户" }
@@ -104,9 +105,10 @@ struct LibraryView: View {
                 if !songs.isEmpty {
                     store.replaceRemote(songs)
                 }
-                totalCount = resp.num_total_results
+                // 不使用 num_total_results（始终返回 21，不可靠）
+                // 只依赖 has_more 判断
                 currentPage = 2
-                hasMorePages = resp.has_more == true
+                hasMorePages = resp.has_more == true && !songs.isEmpty
                 allLoaded = !hasMorePages
                 refreshing = false
             }
@@ -116,7 +118,6 @@ struct LibraryView: View {
                 Task { await preloadRemaining() }
             }
         } catch let error as SunoError {
-            // 区分认证过期 vs 网络错误，给用户明确提示
             await MainActor.run {
                 refreshing = false
                 switch error {
@@ -137,8 +138,8 @@ struct LibraryView: View {
     }
 
     /// 后台预加载剩余页面（用户可同时浏览已加载的歌曲）
+    /// 注意：每页间隔 1.2 秒，避免触发 Suno API 的 429 限流（实测 14 页连续请求就限流）
     func preloadRemaining() async {
-        // 防止重复触发
         guard !loadingMore, !allLoaded, hasMorePages else { return }
         await MainActor.run { loadingMore = true }
 
@@ -151,30 +152,30 @@ struct LibraryView: View {
                 await MainActor.run {
                     if hadNew { store.appendRemote(newSongs) }
                     currentPage += 1
-                    // 智能判断：已知总数时以总数为准；否则依赖 has_more
-                    if let total = totalCount {
-                        hasMorePages = store.items.count < total
-                    } else {
-                        hasMorePages = resp.has_more == true && hadNew
-                    }
+                    // 只依赖 has_more + 是否有新数据判断（不使用 num_total_results）
+                    hasMorePages = resp.has_more == true && hadNew
                     allLoaded = !hasMorePages || !hadNew
                 }
                 consecutiveErrors = 0
-                // 每页之间稍作间隔，避免请求过于密集
-                try? await Task.sleep(nanoseconds: 300_000_000)  // 300ms
+                // 每页间隔 1.2 秒，避免 429 限流
+                try? await Task.sleep(nanoseconds: 1_200_000_000)
             } catch let error as SunoError {
                 consecutiveErrors += 1
                 if case .authExpired = error {
-                    // 认证过期不再重试
                     await MainActor.run { refreshMsg = "登录已过期，请重新登录" }
                     await MainActor.run { loadingMore = false }
                     return
+                }
+                // 429 限流时等待更长时间重试
+                if case .http(let code, _) = error, code == 429 {
+                    consecutiveErrors = 0  // 429 不算致命错误，等待后重试
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)  // 429 时等 5 秒
+                    continue
                 }
                 if consecutiveErrors >= 3 {
                     await MainActor.run { loadingMore = false }
                     return
                 }
-                // 单次失败稍等重试
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             } catch {
                 await MainActor.run { loadingMore = false }
@@ -197,21 +198,19 @@ struct LibraryView: View {
             await MainActor.run {
                 if hadNew { store.appendRemote(newSongs) }
                 currentPage += 1
-                // 智能判断：已知 totalCount 时以"已加载数 < 总数"为准，不依赖不可靠的 has_more
-                if let total = totalCount {
-                    hasMorePages = store.items.count < total
-                } else {
-                    hasMorePages = resp.has_more == true && hadNew
-                }
+                // 只依赖 has_more + 是否有新数据（不使用 num_total_results）
+                hasMorePages = resp.has_more == true && hadNew
                 if !hasMorePages || !hadNew { allLoaded = true }
-                totalCount = resp.num_total_results
             }
         } catch let error as SunoError {
             if case .authExpired = error {
                 await MainActor.run { refreshMsg = "登录已过期，请重新登录" }
+            } else if case .http(let code, _) = error, code == 429 {
+                // 429 限流：静默处理，下次滚动重试
+                await MainActor.run { loadingMore = false }
+                return
             } else {
-                // 单页加载失败不终止分页，下次滚动到底部会重试
-                await MainActor.run { refreshMsg = "加载更多失败，稍后重试：\(error.localizedDescription)" }
+                await MainActor.run { refreshMsg = "加载更多失败：\(error.localizedDescription)" }
             }
         } catch {
             await MainActor.run { refreshMsg = "加载更多失败：\(error.localizedDescription)" }

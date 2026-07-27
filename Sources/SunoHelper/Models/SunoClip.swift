@@ -251,9 +251,13 @@ struct GeneratePayload: Encodable {
     }
 
     /// Cover 翻唱：基于已有歌曲重新生成（保留旋律/结构，换风格/人声）
-    /// 真实请求体（逆向官方 API）：task="cover" + cover_clip_id=<源歌曲id> + generation_type="TEXT"
+    /// 真实请求体（已用 cookie 实测 200 确认）：
+    ///   task="cover" + cover_clip_id=<源歌曲id> + generation_type="TEXT" + prompt=""(必填!) + mv="chirp-auk-turbo"
+    /// 注意：cover 仅 chirp-auk-turbo（免费）和 chirp-fenix/crow/bluejay/auk（Pro）支持，
+    ///   chirp-v4 不支持 cover。免费账户强制用 chirp-auk-turbo。
     static func cover(clipId: String, model: String) -> GeneratePayload {
-        var p = GeneratePayload(make_instrumental: false, mv: model)
+        var p = GeneratePayload(make_instrumental: false, mv: "chirp-auk-turbo")
+        p.prompt = ""                    // API 必填字段！空字符串即可（422 实测确认）
         p.task = "cover"
         p.cover_clip_id = clipId
         p.generation_type = "TEXT"
