@@ -125,6 +125,9 @@ struct SunoAPI {
     }
 
     /// Step 2: 上传文件到 S3（使用预签名 URL + form fields）
+    /// Step 2: 上传文件到 S3（使用预签名 URL + form fields）
+    /// 核心修复：multipart body 写入临时文件，用 URLSession.upload 流传输，
+    /// 避免 4.5MB 直接塞 httpBody 导致 URLSession 内存管理断连（-1005）
     func uploadFileToS3(presignedURL: String, fields: [String: String],
                         fileData: Data, fileName: String, mimeType: String) async throws {
         try await run {
@@ -134,26 +137,16 @@ struct SunoAPI {
             // 构造 multipart body（和之前一样，但先写进临时文件）
             var body = Data()
             for (key, value) in fields {
-                body.append(Data("--\(boundary)
-".utf8))
-                body.append(Data("Content-Disposition: form-data; name=\"\(key)\"
-
-".utf8))
-                body.append(Data("\(value)
-".utf8))
+                body.append(Data("--\(boundary)\r\n".utf8))
+                body.append(Data("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n".utf8))
+                body.append(Data("\(value)\r\n".utf8))
             }
             // 文件字段：文件名用 ASCII 临时名，避免中文编码问题
-            body.append(Data("--\(boundary)
-".utf8))
-            body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"upload.mp3\"
-".utf8))
-            body.append(Data("Content-Type: \(mimeType)
-
-".utf8))
+            body.append(Data("--\(boundary)\r\n".utf8))
+            body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"upload.mp3\"\r\n".utf8))
+            body.append(Data("Content-Type: \(mimeType)\r\n\r\n".utf8))
             body.append(fileData)
-            body.append(Data("
---\(boundary)--
-".utf8))
+            body.append(Data("\r\n--\(boundary)--\r\n".utf8))
 
             // 写入临时文件（URLSession.upload 从文件流传输，大文件稳定）
             let tempDir = FileManager.default.temporaryDirectory
@@ -184,6 +177,7 @@ struct SunoAPI {
             }
         }
     }
+
     /// 音频上传完整流程（Step 1 + Step 2），返回上传结果供后续 generate/cover 使用
     /// 这是新入口：替代旧的直接 multipart 到 generate 的错误方式
     func uploadAudioOnly(fileData: Data, fileName: String) async throws -> AudioUploadResult {
