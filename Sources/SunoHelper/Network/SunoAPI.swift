@@ -293,8 +293,8 @@ struct SunoAPI {
 
     /// 拉取「我的音乐库」——当前账户所有歌曲（分页）
     /// 注意：Suno feed/v2 的 page 参数从 1 开始（非 0）
-    /// 同时发送 page 和 offset 参数 + cache-buster _t
-    /// 日志显示 page=3 返回重复数据，尝试 offset 突破限制
+    /// 同时发送 page 和 offset 参数 + cache-buster _t + sort=newest
+    /// 修复：API 默认排序不是时间倒序，导致新歌不在 page=1，加 sort=newest 强制按时间倒序
     func library(page: Int) async throws -> SunoFeedResponse {
         try await run {
             let safePage = max(page, 1)  // API page 从 1 开始
@@ -305,10 +305,11 @@ struct SunoAPI {
                 URLQueryItem(name: "page", value: String(safePage)),
                 URLQueryItem(name: "offset", value: String(offset)),
                 URLQueryItem(name: "num_results", value: "50"),
+                URLQueryItem(name: "sort", value: "newest"),
                 URLQueryItem(name: "_t", value: cacheBuster)
             ]
             let req = makeRequest(comps.url!)
-            DebugLog.shared.info("音乐库", "GET /api/feed/v2?page=\(safePage)&offset=\(offset)&num_results=50&_t=\(cacheBuster)")
+            DebugLog.shared.info("音乐库", "GET /api/feed/v2?page=\(safePage)&offset=\(offset)&num_results=50&sort=newest&_t=\(cacheBuster)")
             let (data, resp) = try await URLSession.shared.data(for: req)
             if let http = resp as? HTTPURLResponse {
                 DebugLog.shared.info("音乐库", "page=\(safePage) 响应: \(http.statusCode) \(data.count)B")
