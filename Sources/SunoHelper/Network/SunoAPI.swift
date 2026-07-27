@@ -120,10 +120,17 @@ struct SunoAPI {
 
     /// 对文件名做 percent-encoding，确保中文名在 multipart Content-Disposition 中合法
     private func encodedFileName(_ original: String) -> String {
-        if original.allSatisfy({ $0.isASCII && !$0.controlCharacter }) {
+        // 检查是否全是可打印 ASCII（不含控制字符）；否则做 percent-encoding
+        if original.allSatisfy({ $0.isASCII && !isControlChar($0) }) {
             return original
         }
         return original.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? original
+    }
+
+    /// 兼容 Swift 5.9（Xcode 15.4）的 control character 检查（Character.controlCharacter 是 5.10+ 才有）
+    private func isControlChar(_ c: Character) -> Bool {
+        guard let scalar = c.unicodeScalars.first else { return false }
+        return scalar.value < 32 || scalar.value == 127
     }
 
     /// 音频上传 + 生成一体接口（multipart/form-data）— 从文件 URL 读取（兼容旧调用）
