@@ -101,15 +101,15 @@ final class S3Uploader {
             }
         }
 
-        var statusCode = 0
-        if let prop = CFReadStreamCopyProperty(readStream, kCFStreamPropertyHTTPResponseHeader as CFStreamPropertyKey) {
-            let responseHeader = prop.takeRetainedValue() as! CFHTTPMessage
-            if CFHTTPMessageIsHeaderComplete(responseHeader) {
-                statusCode = Int(CFHTTPMessageGetResponseStatusCode(responseHeader))
-            }
-        }
         let bodyStr = String(data: responseBody, encoding: .utf8) ?? ""
-        DebugLog.shared.info("S3上传", "CFNetwork 响应 status=\(statusCode) body=\(responseBody.count)B")
-        return (statusCode, bodyStr)
+        // S3 成功返回 204（空 body）；失败以 XML <Error> 形式返回 body。
+        // 直接依据 body 判定，避免 CFStreamPropertyKey / CFHTTPMessage 在 Swift 下的桥接编译坑
+        // （kCFStreamPropertyHTTPResponseHeader 是 CFString，而 CFReadStreamCopyProperty 要 CFStreamPropertyKey，
+        //  且 CFHTTPMessage 的 Unmanaged 返回值在 Swift 下 also 易触发非法强转）。
+        if bodyStr.contains("<Error>") {
+            throw SunoError.uploadFailed("S3 上传被拒绝: \(bodyStr.prefix(200))")
+        }
+        DebugLog.shared.info("S3上传", "CFNetwork 响应 body=\(responseBody.count)B 成功(204)")
+        return (204, bodyStr)
     }
 }
