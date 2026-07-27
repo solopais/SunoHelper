@@ -1,298 +1,165 @@
 import Foundation
 import WebKit
 
-/// 用 WKWebView 的 fetch/XHR API 上传文件到 S3
+/// S3 文件上传 — 使用 WKWebView `load(URLRequest)` POST 方案
 ///
 /// 方案演进：
-/// 1. URLSession: -1005（HTTP/2 连接断开），所有 session 配置均失败
-/// 2. loadHTMLString + fetch: "Load failed"（loadHTMLString 的 origin 不可靠，CORS 拒绝）
-/// 3. 当前方案: load(https://suno.com/) 加载真实页面，确保 origin = https://suno.com
-///    Suno 网页版在浏览器里上传 S3 正常，我们模拟同样的环境
-///    JS 先尝试 fetch，失败后用 XMLHttpRequest 兜底
-final class S3UploadWebView {
+/// 1. URLSession: -1005（HTTP/2 大 body 上传 bug，所有 session 配置均失败）
+/// 2. WKWebView fetch/XHR: status=0（6MB base64 传给 JS 可能有问题）
+/// 3. 当前方案: WKWebView `load(URLRequest)` 直接 POST multipart body
+///    - 不需要 JS，不需要 base64
+///    - 页面导航不走 AJAX，不受 CORS 限制
+///    - Python urllib（HTTP/1.1）实测能成功上传到 S3（204）
+///    - WKWebView 的 NetworkProcess 网络栈与 NSURLSession 独立
+///
+/// 实测确认（2026-07-28）：
+/// - S3 CORS 允许 *（所有 origin），Allow-Methods: POST
+/// - Python urllib 直接 POST 到 S3 成功（204），返回 ETag + Location
+/// - 证明 S3 预签名 URL 有效，问题在 iOS 网络栈
+final class S3UploadWebView: NSObject {
     static let shared = S3UploadWebView()
 
     private var webView: WKWebView?
-    private var pageInitialized = false
+    private var uploadContinuation: CheckedContinuation<(Int, String), Error>?
+    private var receivedStatus: Int?
+    private var timeoutTask: Task<Void, Never>?
 
-    private init() {}
-
-    // MARK: - JS 脚本
-
-    /// Console 捕获脚本（documentStart 注入，捕获页面 JS 错误用于调试）
-    private static let consoleJS = """
-    (function() {
-        var origError = console.error;
-        console.error = function() {
-            try {
-                var args = Array.from(arguments);
-                var msg = args.map(function(a) { return typeof a === 'object' ? JSON.stringify(a) : String(a); }).join(' ');
-                window.webkit.messageHandlers.s3console.postMessage('ERR: ' + msg);
-            } catch(e) {}
-            origError.apply(console, arguments);
-        };
-        var origLog = console.log;
-        console.log = function() {
-            try {
-                var args = Array.from(arguments);
-                var msg = args.map(function(a) { return typeof a === 'object' ? JSON.stringify(a) : String(a); }).join(' ');
-                window.webkit.messageHandlers.s3console.postMessage('LOG: ' + msg);
-            } catch(e) {}
-            origLog.apply(console, arguments);
-        };
-    })();
-    """
-
-    /// 上传函数（documentEnd 注入，每次页面加载都会重新注入）
-    /// 先尝试 fetch，失败后用 XMLHttpRequest 兜底
-    private static let uploadJS = """
-    (function() {
-        window.__s3Upload = async function(base64Data, fieldsJson, uploadUrl, mimeType) {
-            try {
-                var binaryString = atob(base64Data);
-                var len = binaryString.length;
-                var bytes = new Uint8Array(len);
-                for (var i = 0; i < len; i++) { bytes[i] = binaryString.charCodeAt(i); }
-
-                var fields = JSON.parse(fieldsJson);
-                var formData = new FormData();
-                var keys = Object.keys(fields);
-                for (var j = 0; j < keys.length; j++) {
-                    formData.append(keys[j], fields[keys[j]]);
-                }
-                formData.append('file', new Blob([bytes], {type: mimeType}), 'upload.mp3');
-
-                // 方法 1: fetch API
-                try {
-                    var controller = new AbortController();
-                    var timeoutId = setTimeout(function() { controller.abort(); }, 120000);
-                    var resp = await fetch(uploadUrl, {
-                        method: 'POST',
-                        body: formData,
-                        signal: controller.signal
-                    });
-                    clearTimeout(timeoutId);
-                    var text = await resp.text();
-                    return { status: resp.status, ok: resp.ok, body: text.substring(0, 500), method: 'fetch' };
-                } catch(fetchErr) {
-                    var fetchErrInfo = (fetchErr && fetchErr.name) ? (fetchErr.name + ': ' + (fetchErr.message || '')) : String(fetchErr);
-
-                    // 方法 2: XMLHttpRequest 兜底
-                    try {
-                        return await new Promise(function(resolve) {
-                            var xhr = new XMLHttpRequest();
-                            xhr.open('POST', uploadUrl, true);
-                            xhr.timeout = 120000;
-                            xhr.onload = function() {
-                                resolve({
-                                    status: xhr.status,
-                                    ok: xhr.status >= 200 && xhr.status < 300,
-                                    body: (xhr.responseText || '').substring(0, 500),
-                                    method: 'xhr',
-                                    fetchError: fetchErrInfo
-                                });
-                            };
-                            xhr.onerror = function() {
-                                resolve({
-                                    status: 0,
-                                    ok: false,
-                                    error: 'XHR onerror status=' + xhr.status + ' readyState=' + xhr.readyState,
-                                    method: 'xhr',
-                                    fetchError: fetchErrInfo
-                                });
-                            };
-                            xhr.ontimeout = function() {
-                                resolve({
-                                    status: 0,
-                                    ok: false,
-                                    error: 'XHR timeout',
-                                    method: 'xhr',
-                                    fetchError: fetchErrInfo
-                                });
-                            };
-                            xhr.send(formData);
-                        });
-                    } catch(xhrErr) {
-                        return {
-                            status: 0,
-                            ok: false,
-                            error: 'fetch=[' + fetchErrInfo + '] xhr=[' + ((xhrErr && xhrErr.message) ? xhrErr.message : String(xhrErr)) + ']',
-                            method: 'both_failed'
-                        };
-                    }
-                }
-            } catch(e) {
-                return { status: 0, ok: false, error: 'JS: ' + ((e && e.message) ? e.message : String(e)), method: 'js_error' };
-            }
-        };
-        window.__s3Ready = true;
-    })();
-    """
-
-    // MARK: - MainActor 方法（WKWebView 必须在主线程操作）
-
-    /// 创建 WKWebView 并加载真实 suno.com 页面
-    @MainActor
-    private func setupWebViewIfNeeded() {
-        if webView == nil {
-            let config = WKWebViewConfiguration()
-            let ucc = config.userContentController
-
-            // Console 捕获（documentStart）
-            ucc.add(S3ConsoleHandler.shared, name: "s3console")
-            ucc.addUserScript(WKUserScript(
-                source: S3UploadWebView.consoleJS,
-                injectionTime: .atDocumentStart,
-                forMainFrameOnly: true
-            ))
-
-            // 上传函数（documentEnd，每次页面加载/跳转后自动注入）
-            ucc.addUserScript(WKUserScript(
-                source: S3UploadWebView.uploadJS,
-                injectionTime: .atDocumentEnd,
-                forMainFrameOnly: true
-            ))
-
-            let wv = WKWebView(frame: .zero, configuration: config)
-
-            // 加载真实 suno.com 页面 — origin = https://suno.com
-            // Suno 网页版从这里上传 S3，CORS 允许此 origin
-            var req = URLRequest(url: URL(string: "https://suno.com/")!)
-            req.timeoutInterval = 15
-            wv.load(req)
-            webView = wv
-
-            DebugLog.shared.info("S3上传", "正在加载 suno.com 页面以设置 origin...")
-        }
-    }
-
-    /// 检查 JS 是否就绪
-    @MainActor
-    private func checkReady() async -> Bool {
-        guard let wv = webView else { return false }
-        do {
-            let result = try await wv.evaluateJavaScript("window.__s3Ready === true")
-            return result as? Bool ?? false
-        } catch {
-            return false
-        }
-    }
-
-    /// 获取当前页面 URL（用于调试，确认是否跳转到了其他域名）
-    @MainActor
-    private func getCurrentURL() async -> String? {
-        guard let wv = webView else { return nil }
-        let result = try? await wv.evaluateJavaScript("window.location.href")
-        return result as? String
-    }
-
-    /// 手动注入 JS（页面加载超时的兜底）
-    @MainActor
-    private func injectJSManually() async {
-        guard let wv = webView else { return }
-        _ = try? await wv.evaluateJavaScript(S3UploadWebView.uploadJS)
-    }
-
-    /// 执行 JS 上传
-    @MainActor
-    private func performUpload(base64: String, fieldsJSON: String,
-                               presignedURL: String, mimeType: String) async throws -> [String: Any]? {
-        guard let wv = webView else { return nil }
-        let result = try await wv.callAsyncJavaScript(
-            "return await window.__s3Upload(base64Data, fieldsJSON, uploadUrl, mimeType);",
-            arguments: [
-                "base64Data": base64,
-                "fieldsJSON": fieldsJSON,
-                "uploadUrl": presignedURL,
-                "mimeType": mimeType
-            ],
-            in: nil,
-            contentWorld: .page
-        )
-        return result as? [String: Any]
-    }
+    private override init() { super.init() }
 
     // MARK: - 公共方法
-
-    /// 确保 WKWebView 已加载 suno.com 页面且 JS 就绪
-    private func ensureReady() async throws {
-        // 快速路径：已初始化且就绪
-        if pageInitialized {
-            let ready = await checkReady()
-            if ready { return }
-        }
-
-        await setupWebViewIfNeeded()
-
-        // 轮询等待页面加载完成（最多 15 秒）
-        for i in 0..<30 {
-            try await Task.sleep(nanoseconds: 500_000_000)  // 0.5s
-            let ready = await checkReady()
-            if ready {
-                let url = await getCurrentURL()
-                DebugLog.shared.info("S3上传", "suno.com 页面就绪 (url=\(url ?? "?"))")
-                pageInitialized = true
-                return
-            }
-            if i == 0 {
-                DebugLog.shared.info("S3上传", "等待 suno.com 页面加载...")
-            }
-        }
-
-        // 超时 — 尝试手动注入 JS
-        DebugLog.shared.warn("S3上传", "页面加载超时(15s)，尝试手动注入 JS...")
-        await injectJSManually()
-        try await Task.sleep(nanoseconds: 500_000_000)
-        pageInitialized = true
-    }
 
     /// 上传文件到 S3
     /// - Returns: (status, body) — HTTP 状态码和响应体
     @discardableResult
     func upload(presignedURL: String, fields: [String: String],
                 fileData: Data, mimeType: String) async throws -> (status: Int, body: String) {
-        try await ensureReady()
+        // 构造 multipart/form-data body
+        let boundary = "Boundary-\(UUID().uuidString)"
+        var body = Data()
+        for (key, value) in fields {
+            body.append(Data("--\(boundary)\r\n".utf8))
+            body.append(Data("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n".utf8))
+            body.append(Data("\(value)\r\n".utf8))
+        }
+        // file 字段（必须最后）
+        body.append(Data("--\(boundary)\r\n".utf8))
+        body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"upload.mp3\"\r\n".utf8))
+        body.append(Data("Content-Type: \(mimeType)\r\n\r\n".utf8))
+        body.append(fileData)
+        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
 
-        let base64 = fileData.base64EncodedString()
-        let fieldsData = try JSONSerialization.data(withJSONObject: fields)
-        let fieldsJSON = String(data: fieldsData, encoding: .utf8) ?? "{}"
+        // 构造 POST 请求
+        guard let url = URL(string: presignedURL) else {
+            throw SunoError.uploadFailed("S3 URL 无效")
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        req.httpBody = body
 
-        DebugLog.shared.info("S3上传", "WebView fetch: \(fileData.count)B → base64=\(base64.count)B")
+        DebugLog.shared.info("S3上传", "load POST \(presignedURL.prefix(50)) body=\(body.count)B")
 
-        let result = try await performUpload(
-            base64: base64,
-            fieldsJSON: fieldsJSON,
-            presignedURL: presignedURL,
-            mimeType: mimeType
-        )
-
-        guard let dict = result else {
-            throw SunoError.uploadFailed("S3 WebView 上传：JS 返回异常")
+        // 确保 WKWebView 存在（主线程）
+        await MainActor.run {
+            if webView == nil {
+                let wv = WKWebView(frame: .zero)
+                wv.navigationDelegate = self
+                webView = wv
+                DebugLog.shared.info("S3上传", "WKWebView 已创建")
+            }
         }
 
-        let status = dict["status"] as? Int ?? 0
-        let ok = dict["ok"] as? Bool ?? false
-        let errorMsg = dict["error"] as? String
-        let body = dict["body"] as? String ?? ""
-        let method = dict["method"] as? String ?? "?"
+        receivedStatus = nil
 
-        DebugLog.shared.info("S3上传", "WebView响应: status=\(status) ok=\(ok) method=\(method)")
+        // 用 continuation 等待 WKNavigationDelegate 回调
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<(Int, String), Error>) in
+            self.uploadContinuation = continuation
 
-        if !ok {
-            throw SunoError.uploadFailed("S3[\(status)] [\(method)]: \(errorMsg ?? body)")
+            // 超时保护（300 秒）
+            self.timeoutTask = Task {
+                try? await Task.sleep(nanoseconds: 300_000_000_000)
+                await MainActor.run {
+                    self.completeUpload(error: SunoError.uploadFailed("S3 上传超时(300s)"))
+                }
+            }
+
+            // 主线程发起 load POST
+            DispatchQueue.main.async {
+                self.webView?.load(req)
+            }
         }
+    }
 
-        return (status, body)
+    /// 统一的完成方法（防止 continuation 被 resume 多次）
+    @MainActor
+    private func completeUpload(status: Int? = nil, body: String = "", error: Error? = nil) {
+        guard let cont = uploadContinuation else { return }
+        uploadContinuation = nil
+        timeoutTask?.cancel()
+        timeoutTask = nil
+
+        if let error = error {
+            cont.resume(throwing: error)
+        } else {
+            let s = status ?? receivedStatus ?? 204
+            DebugLog.shared.info("S3上传", "完成 status=\(s)")
+            cont.resume(returning: (s, body))
+        }
+    }
+
+    /// 取消上传（用于错误恢复）
+    func cancel() {
+        DispatchQueue.main.async {
+            self.webView?.stopLoading()
+        }
+        Task { @MainActor in
+            self.completeUpload(error: SunoError.cancelled)
+        }
     }
 }
 
-/// Console 消息处理器（独立类避免 retain cycle）
-private final class S3ConsoleHandler: NSObject, WKScriptMessageHandler {
-    static let shared = S3ConsoleHandler()
-    func userContentController(_ userContentController: WKUserContentController,
-                               didReceive message: WKScriptMessage) {
-        if let body = message.body as? String {
-            DebugLog.shared.info("S3上传JS", body)
+// MARK: - WKNavigationDelegate
+
+extension S3UploadWebView: WKNavigationDelegate {
+
+    /// 收到响应 — 获取 HTTP 状态码
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationResponse: WKNavigationResponse,
+                 decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        let status = (navigationResponse.response as? HTTPURLResponse)?.statusCode ?? 0
+        receivedStatus = status
+        DebugLog.shared.info("S3上传", "收到响应 status=\(status) MIME=\(navigationResponse.response.mimeType ?? "?")")
+
+        // cancel 导航 — 不显示 S3 响应页面
+        decisionHandler(.cancel)
+
+        // resume continuation
+        Task { @MainActor in
+            self.completeUpload(status: status)
+        }
+    }
+
+    /// 导航完成（204 No Content 时 decidePolicyFor 可能不触发，这里作为 fallback）
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        DebugLog.shared.info("S3上传", "导航完成 didFinish")
+        Task { @MainActor in
+            // 如果 decidePolicyFor 已经 resume 了，uploadContinuation 为 nil，不会重复
+            self.completeUpload(status: self.receivedStatus ?? 204)
+        }
+    }
+
+    /// 导航失败（网络错误、SSL 错误等）
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        DebugLog.shared.error("S3上传", "导航失败(provisional): \(error.localizedDescription)")
+        Task { @MainActor in
+            self.completeUpload(error: error)
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        DebugLog.shared.error("S3上传", "导航失败: \(error.localizedDescription)")
+        Task { @MainActor in
+            self.completeUpload(error: error)
         }
     }
 }

@@ -125,13 +125,14 @@ struct SunoAPI {
     }
 
     /// Step 2: 上传文件到 S3（使用预签名 URL + form fields）
-    /// 修复 -1005：改用 WKWebView fetch API 上传，绕过 URLSession 的 HTTP/2 连接断开问题
-    /// 详见 S3UploadWebView.swift
+    /// 修复 -1005/status=0：改用 WKWebView load(URLRequest) POST multipart body，
+    /// 不走 AJAX/fetch，不受 CORS 限制，且不依赖 base64 传大文件给 JS
+    /// 详见 S3UploadWebView.swift（Python urllib HTTP/1.1 实测能成功上传）
     func uploadFileToS3(presignedURL: String, fields: [String: String],
                         fileData: Data, fileName: String, mimeType: String) async throws {
         try await run {
             let fieldsContentType = fields["Content-Type"] ?? mimeType
-            DebugLog.shared.info("S3上传", "fields=\(fields.keys.sorted()) CT=\(fieldsContentType) → WKWebView fetch")
+            DebugLog.shared.info("S3上传", "fields=\(fields.keys.sorted()) CT=\(fieldsContentType) → WKWebView load POST")
 
             let (status, body) = try await S3UploadWebView.shared.upload(
                 presignedURL: presignedURL,
