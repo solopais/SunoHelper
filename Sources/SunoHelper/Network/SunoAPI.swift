@@ -125,16 +125,16 @@ struct SunoAPI {
     }
 
     /// Step 2: 上传文件到 S3（使用预签名 URL + form fields）
-    /// 修复 -1005/status=0：改用 WKWebView load(URLRequest) POST multipart body，
-    /// 不走 AJAX/fetch，不受 CORS 限制，且不依赖 base64 传大文件给 JS
-    /// 详见 S3UploadWebView.swift（Python urllib HTTP/1.1 实测能成功上传）
+    /// 修复 -1005：改用 CFNetwork CFReadStreamCreateForHTTPRequest 强制 HTTP/1.1 直接 POST，
+    /// 从根上绕开 iOS URLSession/WKWebView 的 HTTP/2 大文件上传 -1005 bug
+    /// 详见 S3Uploader.swift（Python urllib HTTP/1.1 实测能成功上传）
     func uploadFileToS3(presignedURL: String, fields: [String: String],
                         fileData: Data, fileName: String, mimeType: String) async throws {
         try await run {
             let fieldsContentType = fields["Content-Type"] ?? mimeType
-            DebugLog.shared.info("S3上传", "fields=\(fields.keys.sorted()) CT=\(fieldsContentType) → WKWebView load POST")
+            DebugLog.shared.info("S3上传", "fields=\(fields.keys.sorted()) CT=\(fieldsContentType) → CFNetwork HTTP/1.1 POST")
 
-            let (status, body) = try await S3UploadWebView.shared.upload(
+            let (status, body) = try await S3Uploader.shared.upload(
                 presignedURL: presignedURL,
                 fields: fields,
                 fileData: fileData,
