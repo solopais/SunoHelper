@@ -69,8 +69,8 @@ struct SongCard: View {
                     .tint(AppTheme.accent)
             }
 
-            // 操作行
-            HStack(spacing: 18) {
+            // 操作行（等宽排列 6 个按钮）
+            HStack(spacing: 0) {
                 compactAction(icon: dl.isDownloading(audioKey) ? "arrow.down.circle" : (dl.isDownloaded(path: song.downloadedLocalPath) ? "checkmark.circle.fill" : "arrow.down.circle"),
                               label: dlStatusLabel) {
                     download()
@@ -96,7 +96,7 @@ struct SongCard: View {
                 }
                 .disabled(song.audioURL == nil)
 
-                compactAction(icon: "waveform.badge.mic", label: "翻唱") {
+                compactAction(icon: "mic.fill", label: "翻唱") {
                     onCover()
                 }
                 .disabled(song.audioURL == nil)
@@ -169,6 +169,7 @@ struct SongCard: View {
                     .font(.system(size: 11))
                     .foregroundColor(AppTheme.textSecondary)
             }
+            .frame(maxWidth: .infinity)   // 等宽分布
         }
         .buttonStyle(.plain)
         .contentShape(Rectangle())

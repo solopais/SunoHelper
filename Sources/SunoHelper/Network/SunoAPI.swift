@@ -70,7 +70,6 @@ struct SunoAPI {
                 ("make_instrumental", "\(payload.make_instrumental)"),
                 ("mv", payload.mv),
                 ("generation_type", "AUDIO_UPLOAD"),
-                ("input", payload.input),
                 ("prompt", payload.prompt.isEmpty ? nil : payload.prompt),
                 ("gpt_description_prompt", payload.gpt_description_prompt),
                 ("tags", payload.tags),
