@@ -85,9 +85,8 @@ final class S3Uploader {
         let readStream = CFReadStreamCreateForHTTPRequest(nil, request).takeRetainedValue()
         // 强制 Connection: close：S3 响应后直接关闭 TCP 连接 → 干净的 EOF（n==0），
         // 避免 HTTP/1.1 keep-alive 下响应已读完、连接却不关闭导致 CFReadStreamRead 返回 -1 误报“读取响应失败”。
-        if let pk = CFStreamPropertyKey(rawValue: kCFStreamPropertyHTTPAttemptPersistentConnection) {
-            CFReadStreamSetProperty(readStream, pk, kCFBooleanFalse)
-        }
+        let pk = CFStreamPropertyKey(rawValue: kCFStreamPropertyHTTPAttemptPersistentConnection)
+        CFReadStreamSetProperty(readStream, pk, kCFBooleanFalse)
         guard CFReadStreamOpen(readStream) else {
             throw SunoError.uploadFailed("S3 上传：无法建立网络连接")
         }
@@ -113,7 +112,7 @@ final class S3Uploader {
         let respKey = CFStreamPropertyKey(rawValue: kCFStreamPropertyHTTPResponseHeader)
         var statusCode = 0
         if let prop = CFReadStreamCopyProperty(readStream, respKey) {
-            let responseHeader = prop.takeRetainedValue() as! CFHTTPMessage
+            let responseHeader = prop as! CFHTTPMessage
             if CFHTTPMessageIsHeaderComplete(responseHeader) {
                 statusCode = Int(CFHTTPMessageGetResponseStatusCode(responseHeader))
             }
