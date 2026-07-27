@@ -17,6 +17,10 @@ enum SunoError: LocalizedError {
         case .http(let c, let m):
             return "请求失败 (\(c))：\(String(m.prefix(200)))"
         case .network(let e):
+            // 加 URLError code 帮助定位（networkConnectionLost=-1005 等）
+            if let urlErr = e as? URLError {
+                return "网络错误[\(urlErr.errorCode)]：\(e.localizedDescription)"
+            }
             return "网络错误：\(e.localizedDescription)"
         case .cancelled:
             return "已取消"
@@ -78,6 +82,7 @@ struct SunoAPI {
         } catch is CancellationError {
             throw SunoError.cancelled
         } catch {
+            DebugLog.shared.error("网络", "\(type(of: error)): \(error.localizedDescription)")
             throw SunoError.network(error)
         }
     }
@@ -107,9 +112,14 @@ struct SunoAPI {
             req.httpBody = body
             req.timeoutInterval = 30
 
+            DebugLog.shared.info("上传", "Step1 POST /api/uploads/audio/ ext=\(fileExtension)")
             let (data, resp) = try await URLSession.shared.data(for: req)
+            if let http = resp as? HTTPURLResponse {
+                DebugLog.shared.info("上传", "Step1 响应: \(http.statusCode)")
+            }
             try Self.check(resp: resp, data: data)
             let decoded = try JSONDecoder().decode(AudioUploadRequestResponse.self, from: data)
+            DebugLog.shared.success("上传", "Step1 成功 id=\(decoded.id.prefix(8)) url=\(decoded.url.prefix(40))")
             return decoded
         }
     }
@@ -140,17 +150,21 @@ struct SunoAPI {
             var req = URLRequest(url: s3URL)
             req.httpMethod = "POST"
             req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-            req.setValue("\(body.count)", forHTTPHeaderField: "Content-Length")
+            // 不手动设 Content-Length！URLSession 用 httpBody 时自动计算，
+            // 手动设会导致重复 header → S3 reset 连接 → "网络连接已中断"
             req.httpBody = body
             req.timeoutInterval = 300  // 大文件给 5 分钟
 
+            DebugLog.shared.info("S3上传", "POST \(presignedURL.prefix(60))... body=\(body.count)B")
             let (data, resp) = try await URLSession.shared.data(for: req)
-            // S3 返回 204 No Content 或 200 OK 表示成功
             if let http = resp as? HTTPURLResponse {
+                DebugLog.shared.info("S3上传", "响应状态: \(http.statusCode)")
                 if !(200...299).contains(http.statusCode) {
-                    let msg = String(data: data, encoding: .utf8) ?? "S3 upload failed with status \(http.statusCode)"
-                    throw SunoError.uploadFailed(msg)
+                    let msg = String(data: data, encoding: .utf8) ?? "(empty)"
+                    DebugLog.shared.error("S3上传", "失败[\(http.statusCode)]: \(msg.prefix(300))")
+                    throw SunoError.uploadFailed("S3[\(http.statusCode)]: \(msg.prefix(200))")
                 }
+                DebugLog.shared.success("S3上传", "上传成功 (\(http.statusCode))")
             }
         }
     }
@@ -248,6 +262,11 @@ struct SunoAPI {
         return try await generateWithAudioData(fileData: fileData, fileName: fileURL.lastPathComponent, payload: payload)
     }
 
+    /// 根据文件扩展名推断 MIME 类型（公开版本，供外部调用）
+    func mimeTypeForAudioPublic(_ fileName: String) -> String {
+        return mimeTypeForAudio(fileName)
+    }
+
     /// 根据文件扩展名推断 MIME 类型
     private func mimeTypeForAudio(_ fileName: String) -> String {
         let ext = (fileName as NSString).pathExtension.lowercased()
@@ -268,9 +287,14 @@ struct SunoAPI {
             let url = URL(string: "\(SunoAPI.base)/api/generate/v2/")!
             let body = try JSONEncoder().encode(payload)
             let req = makeRequest(url, method: "POST", body: body)
+            DebugLog.shared.info("生成", "POST /api/generate/v2/ task=\(payload.task ?? "?") mv=\(payload.mv)")
             let (data, resp) = try await URLSession.shared.data(for: req)
+            if let http = resp as? HTTPURLResponse {
+                DebugLog.shared.info("生成", "响应: \(http.statusCode)")
+            }
             try Self.check(resp: resp, data: data)
             let decoded = try JSONDecoder().decode(GenerateResponse.self, from: data)
+            DebugLog.shared.success("生成", "成功 \(decoded.clips.count) clips")
             return decoded.clips
         }
     }
@@ -297,9 +321,14 @@ struct SunoAPI {
                 URLQueryItem(name: "page", value: String(safePage))
             ]
             let req = makeRequest(comps.url!)
+            DebugLog.shared.info("音乐库", "GET /api/feed/v2?page=\(safePage)")
             let (data, resp) = try await URLSession.shared.data(for: req)
+            if let http = resp as? HTTPURLResponse {
+                DebugLog.shared.info("音乐库", "page=\(safePage) 响应: \(http.statusCode) \(data.count)B")
+            }
             try Self.check(resp: resp, data: data)
             if let wrapped = try? JSONDecoder().decode(SunoFeedResponse.self, from: data) {
+                DebugLog.shared.info("音乐库", "page=\(safePage) clips=\(wrapped.clips.count) has_more=\(wrapped.has_more ?? false)")
                 return wrapped
             }
             let arr = Self.decodeClips(data)
@@ -348,6 +377,7 @@ struct SunoAPI {
         }
         if http.statusCode == 403 {
             let msg = String(data: data, encoding: .utf8) ?? ""
+            DebugLog.shared.error("API", "403: \(msg.prefix(200))")
             // 区分"登录过期"和"模型权限不足"
             if msg.contains("don't have access") || msg.contains("Upgrade your plan") {
                 throw SunoError.http(403, msg)  // 模型权限不足，不是登录问题
@@ -356,6 +386,7 @@ struct SunoAPI {
         }
         if http.statusCode == 422 {
             let msg = String(data: data, encoding: .utf8) ?? ""
+            DebugLog.shared.error("API", "422: \(msg.prefix(200))")
             if msg.contains("token_validation_failed") || msg.contains("verify your request") {
                 throw SunoError.captcha
             }

@@ -9,6 +9,8 @@ struct SettingsView: View {
     @State private var planType: SunoPlanType = .unknown
     @State private var creditsMsg = ""
     @State private var showClear = false
+    @StateObject private var debugLog = DebugLog.shared
+    @State private var showDebugLog = false
 
     var body: some View {
         AppNav {
@@ -102,6 +104,20 @@ struct SettingsView: View {
                 }
                 .listRowBackground(AppTheme.surface)
 
+                Section("调试") {
+                    NavigationLink(destination: DebugLogView()) {
+                        HStack {
+                            Image(systemName: "doc.text.magnifyingglass")
+                            Text("调试日志")
+                            Spacer()
+                            Text("\(debugLog.entries.count)")
+                                .font(.caption).foregroundColor(AppTheme.textSecondary)
+                        }
+                    }
+                    .foregroundColor(AppTheme.text)
+                }
+                .listRowBackground(AppTheme.surface)
+
                 Section("关于") {
                     HStack {
                         Text("版本")
@@ -167,6 +183,81 @@ struct SettingsView: View {
             return "v4.5-all / v4（免费版）"
         }
         return "全部 6 个模型（含 v5.5 Pro）"
+    }
+}
+
+// MARK: - 调试日志视图
+struct DebugLogView: View {
+    @StateObject private var debugLog = DebugLog.shared
+
+    var body: some View {
+        List {
+            Section {
+                HStack {
+                    Button(action: { debugLog.clear() }) {
+                        Label("清空日志", systemImage: "trash")
+                            .foregroundColor(.red)
+                    }
+                    Spacer()
+                    Button(action: copyLog) {
+                        Label("复制全部", systemImage: "doc.on.doc")
+                            .foregroundColor(AppTheme.accent)
+                    }
+                }
+            }
+            .listRowBackground(AppTheme.surface)
+
+            Section("日志（最新在前）") {
+                ForEach(debugLog.entries) { entry in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            Text(entry.level.rawValue)
+                                .font(.system(size: 10, design: .monospaced))
+                                .padding(.horizontal, 4).padding(.vertical, 1)
+                                .background(levelColor(entry.level).opacity(0.2))
+                                .foregroundColor(levelColor(entry.level))
+                                .clipShape(RoundedRectangle(cornerRadius: 3))
+                            Text(entry.category)
+                                .font(.caption2).foregroundColor(AppTheme.textSecondary)
+                            Spacer()
+                            Text(timeString(entry.timestamp))
+                                .font(.caption2).foregroundColor(AppTheme.textSecondary)
+                        }
+                        Text(entry.message)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(AppTheme.text)
+                            .lineLimit(nil)
+                    }
+                    .listRowBackground(AppTheme.surface)
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
+                }
+            }
+        }
+        .listStyle(.insetGrouped)
+        .hideScrollContentBackground()
+        .background(AppTheme.bg)
+        .navigationTitle("调试日志")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    func levelColor(_ level: DebugLog.Level) -> Color {
+        switch level {
+        case .info: return AppTheme.textSecondary
+        case .warn: return .orange
+        case .error: return AppTheme.error
+        case .success: return AppTheme.success
+        }
+    }
+
+    func timeString(_ date: Date) -> String {
+        let df = DateFormatter()
+        df.dateFormat = "HH:mm:ss"
+        return df.string(from: date)
+    }
+
+    func copyLog() {
+        UIPasteboard.general.string = debugLog.exportText()
     }
 }
 

@@ -308,35 +308,62 @@ struct GenerateView: View {
                 // 用户明确要求：上传音频 → 进入音乐库 → 在音乐库点击翻唱
                 // 不是上传后直接生成
                 if let audioData = pickedAudioData, let audioURL = pickedAudioURL {
-                    // Step 1+2: 上传到 S3
-                    message = "正在上传音频到 Suno（1/3）…"
-                    let uploadResult = try await SunoAPI.shared.uploadAudioOnly(
-                        fileData: audioData,
-                        fileName: audioURL.lastPathComponent
-                    )
+                    let fileName = audioURL.lastPathComponent
+                    let fileSize = audioData.count
+                    DebugLog.shared.info("上传", "开始上传: \(fileName) (\(fileSize) bytes)")
 
-                    // Step 3: 轮询处理状态（Suno 后端需要时间分析音频）
-                    message = "音频已上传，等待 Suno 处理（2/3）…"
+                    // Step 1: 获取 S3 预签名 URL
+                    await MainActor.run { message = "正在请求上传地址（1/4）…" }
+                    let uploadReq: AudioUploadRequestResponse
+                    do {
+                        let ext = (fileName as NSString).pathExtension.lowercased()
+                        uploadReq = try await SunoAPI.shared.requestAudioUpload(
+                            fileExtension: ext.isEmpty ? "mp3" : ext
+                        )
+                        DebugLog.shared.success("上传", "Step1 完成: id=\(uploadReq.id.prefix(8))")
+                    } catch {
+                        DebugLog.shared.error("上传", "Step1 失败: \(error.localizedDescription)")
+                        throw SunoError.uploadFailed("Step1 获取上传地址失败: \(error.localizedDescription)")
+                    }
+
+                    // Step 2: 上传文件到 S3
+                    await MainActor.run { message = "正在上传音频文件到 S3（2/4）… \(fileSize / 1024)KB" }
+                    do {
+                        let mimeType = SunoAPI.shared.mimeTypeForAudioPublic(fileName)
+                        try await SunoAPI.shared.uploadFileToS3(
+                            presignedURL: uploadReq.url,
+                            fields: uploadReq.fields,
+                            fileData: audioData,
+                            fileName: fileName,
+                            mimeType: mimeType
+                        )
+                        DebugLog.shared.success("上传", "Step2 S3上传完成")
+                    } catch {
+                        DebugLog.shared.error("上传", "Step2 S3失败: \(error.localizedDescription)")
+                        throw SunoError.uploadFailed("Step2 S3上传失败: \(error.localizedDescription)")
+                    }
+
+                    // Step 3: 轮询处理状态
+                    await MainActor.run { message = "音频已上传，等待 Suno 处理（3/4）…" }
                     var processingRounds = 0
                     var uploadStatus: AudioUploadStatus
                     repeat {
                         try await Task.sleep(nanoseconds: 3_000_000_000)
                         processingRounds += 1
-                        uploadStatus = try await SunoAPI.shared.pollUploadStatus(uploadId: uploadResult.uploadId)
+                        uploadStatus = try await SunoAPI.shared.pollUploadStatus(uploadId: uploadReq.id)
                         await MainActor.run {
                             message = "Suno 处理中（\(processingRounds * 3)s）…状态：\(uploadStatus.status ?? "unknown")"
                         }
-                    } while uploadStatus.status == "processing" && processingRounds < 60  // 最长 3 分钟
+                    } while uploadStatus.status == "processing" && processingRounds < 60
 
-                    // 处理完成，刷新音乐库
+                    // Step 4: 完成
                     await MainActor.run {
                         message = "✅ 音频上传成功！已加入音乐库，可点击「翻唱」进行改编"
                         busy = false
                         resetForm()
-                        // 通知音乐库刷新，用户能看到新上传的歌曲
                         NotificationCenter.default.post(name: Notification.Name("SunoReloadLibrary"), object: nil)
                     }
-                    return  // 上传流程结束，不走下面的生成流程
+                    return
                 }
 
                 // 正常生成流程（非音频上传）
@@ -384,7 +411,10 @@ struct GenerateView: View {
             } catch {
                 await MainActor.run {
                     busy = false
-                    message = "❌ \(error.localizedDescription)"
+                    // 显示完整错误详情（含 HTTP 状态码/响应体/URLError code）
+                    let detail = error.localizedDescription
+                    message = "❌ \(detail)"
+                    DebugLog.shared.error("创作", "失败: \(detail)")
                     if let se = error as? SunoError, case .captcha = se {
                         captchaBlocked = true
                     }

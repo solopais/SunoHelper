@@ -133,7 +133,11 @@ struct LibraryView: View {
 
                         if !lastHasMore || songs2.isEmpty { break }
                     } catch {
-                        // 第 2-3 页失败不致命，用户已看到第 1 页
+                        // 第 2-3 页失败：显示错误但保留已加载的
+                        DebugLog.shared.error("音乐库", "page=\(page) 失败: \(error.localizedDescription)")
+                        await MainActor.run {
+                            refreshMsg = "第\(page)页加载失败: \(error.localizedDescription.prefix(100))。已加载\(store.items.count)首"
+                        }
                         break
                     }
                 }
