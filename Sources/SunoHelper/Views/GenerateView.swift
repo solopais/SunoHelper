@@ -597,7 +597,7 @@ private struct CoverHeader: View {
     let clipId: String
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Label("翻唱模式", systemImage: "waveform.badge.mic")
+            Label("翻唱模式", systemImage: "mic.fill")
                 .font(.headline).foregroundColor(AppTheme.accent)
             Text("基于已选歌曲重新生成（保留原曲结构，可换风格/模型）\nid: \(clipId.prefix(8))…")
                 .font(.caption).foregroundColor(AppTheme.textSecondary)

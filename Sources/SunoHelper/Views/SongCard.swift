@@ -96,10 +96,10 @@ struct SongCard: View {
                 }
                 .disabled(song.audioURL == nil)
 
+                // 翻唱基于服务端 clip_id 重新生成，不需要本地音频文件，故不依赖 audioURL
                 compactAction(icon: "mic.fill", label: "翻唱") {
                     onCover()
                 }
-                .disabled(song.audioURL == nil)
 
                 if !song.lyric.isEmpty {
                     compactAction(icon: "text.alignleft", label: "歌词") {
