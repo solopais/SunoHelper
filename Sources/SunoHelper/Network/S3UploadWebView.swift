@@ -82,6 +82,55 @@ final class S3UploadWebView {
     </body></html>
     """
 
+    // MARK: - MainActor 方法（WKWebView 必须在主线程操作）
+
+    /// 在主线程创建 WKWebView 并加载 HTML
+    @MainActor
+    private func setupWebViewIfNeeded() {
+        if webView == nil {
+            let config = WKWebViewConfiguration()
+            let wv = WKWebView(frame: .zero, configuration: config)
+            // baseURL 设为 suno.com，使页面 origin = https://suno.com
+            // S3 CORS 配置允许来自 suno.com 的 POST 请求
+            wv.loadHTMLString(S3UploadWebView.htmlContent,
+                              baseURL: URL(string: "https://suno.com")!)
+            webView = wv
+        }
+    }
+
+    /// 检查 JS 是否就绪
+    @MainActor
+    private func checkReady() async -> Bool {
+        guard let wv = webView else { return false }
+        do {
+            let result = try await wv.evaluateJavaScript("window.__s3Ready === true")
+            return result as? Bool ?? false
+        } catch {
+            return false
+        }
+    }
+
+    /// 执行 JS fetch 上传
+    @MainActor
+    private func performUpload(base64: String, fieldsJSON: String,
+                               presignedURL: String, mimeType: String) async throws -> [String: Any]? {
+        guard let wv = webView else { return nil }
+        let result = try await wv.callAsyncJavaScript(
+            "return await window.__s3Upload(base64Data, fieldsJSON, uploadUrl, mimeType);",
+            arguments: [
+                "base64Data": base64,
+                "fieldsJSON": fieldsJSON,
+                "uploadUrl": presignedURL,
+                "mimeType": mimeType
+            ],
+            in: nil,
+            contentWorld: .page
+        )
+        return result as? [String: Any]
+    }
+
+    // MARK: - 公共方法
+
     /// 确保 WKWebView 已加载 HTML 页面
     private func ensureReady() async throws {
         readyLock.lock()
@@ -89,37 +138,22 @@ final class S3UploadWebView {
         readyLock.unlock()
         if already { return }
 
-        try await MainActor.run {
-            if self.webView == nil {
-                let config = WKWebViewConfiguration()
-                let wv = WKWebView(frame: .zero, configuration: config)
-                // baseURL 设为 suno.com，使页面 origin = https://suno.com
-                // S3 CORS 配置允许来自 suno.com 的 POST 请求
-                wv.loadHTMLString(S3UploadWebView.htmlContent,
-                                  baseURL: URL(string: "https://suno.com")!)
-                self.webView = wv
-            }
-        }
+        await setupWebViewIfNeeded()
 
         // loadHTMLString 加载本地 HTML，通常 < 200ms，给 0.5s 余量
         try await Task.sleep(nanoseconds: 500_000_000)
 
         // 验证 JS 函数已就绪
-        let ready: Any? = try await MainActor.run {
-            guard let wv = self.webView else { return false }
-            return try? await wv.evaluateJavaScript("window.__s3Ready === true")
-        }
-        if let r = ready as? Bool, r {
-            readyLock.lock()
-            isReady = true
-            readyLock.unlock()
-        } else {
+        var ready = await checkReady()
+        if !ready {
             // 重试一次
             try await Task.sleep(nanoseconds: 500_000_000)
-            readyLock.lock()
-            isReady = true
-            readyLock.unlock()
+            ready = await checkReady()
         }
+
+        readyLock.lock()
+        isReady = true
+        readyLock.unlock()
     }
 
     /// 上传文件到 S3
@@ -135,22 +169,14 @@ final class S3UploadWebView {
 
         DebugLog.shared.info("S3上传", "WebView fetch: \(fileData.count)B → base64=\(base64.count)B")
 
-        let result: Any? = try await MainActor.run {
-            guard let wv = self.webView else { return nil }
-            return try? await wv.callAsyncJavaScript(
-                "return await window.__s3Upload(base64Data, fieldsJSON, uploadUrl, mimeType);",
-                arguments: [
-                    "base64Data": base64,
-                    "fieldsJSON": fieldsJSON,
-                    "uploadUrl": presignedURL,
-                    "mimeType": mimeType
-                ],
-                in: nil,
-                contentWorld: .page
-            )
-        }
+        let result = try await performUpload(
+            base64: base64,
+            fieldsJSON: fieldsJSON,
+            presignedURL: presignedURL,
+            mimeType: mimeType
+        )
 
-        guard let dict = result as? [String: Any] else {
+        guard let dict = result else {
             throw SunoError.uploadFailed("S3 WebView 上传：JS 返回异常")
         }
 
