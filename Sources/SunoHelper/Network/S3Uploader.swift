@@ -83,6 +83,11 @@ final class S3Uploader {
         CFHTTPMessageSetBody(request, body as CFData)
 
         let readStream = CFReadStreamCreateForHTTPRequest(nil, request).takeRetainedValue()
+        // 强制 Connection: close：S3 响应后直接关闭 TCP 连接 → 干净的 EOF（n==0），
+        // 避免 HTTP/1.1 keep-alive 下响应已读完、连接却不关闭导致 CFReadStreamRead 返回 -1 误报“读取响应失败”。
+        if let pk = CFStreamPropertyKey(rawValue: kCFStreamPropertyHTTPAttemptPersistentConnection) {
+            CFReadStreamSetProperty(readStream, pk, kCFBooleanFalse)
+        }
         guard CFReadStreamOpen(readStream) else {
             throw SunoError.uploadFailed("S3 上传：无法建立网络连接")
         }
@@ -97,19 +102,37 @@ final class S3Uploader {
             } else if n == 0 {
                 break
             } else {
-                throw SunoError.uploadFailed("S3 读取响应失败")
+                // n < 0：响应阶段传输层报错，多为 keep-alive 下连接被 S3 关闭的 EOF 误报。
+                // 跳出循环，交由下方状态码 / body 做权威判定，避免误报“读取响应失败”。
+                break
+            }
+        }
+
+        // 读取 HTTP 状态码（response header）做权威判定。
+        // 用 CFStreamPropertyKey(rawValue:) 桥接（之前的 as 强转会触发编译错误）。
+        let respKey = CFStreamPropertyKey(rawValue: kCFStreamPropertyHTTPResponseHeader)
+        var statusCode = 0
+        if let prop = CFReadStreamCopyProperty(readStream, respKey) {
+            let responseHeader = prop.takeRetainedValue() as! CFHTTPMessage
+            if CFHTTPMessageIsHeaderComplete(responseHeader) {
+                statusCode = Int(CFHTTPMessageGetResponseStatusCode(responseHeader))
             }
         }
 
         let bodyStr = String(data: responseBody, encoding: .utf8) ?? ""
-        // S3 成功返回 204（空 body）；失败以 XML <Error> 形式返回 body。
-        // 直接依据 body 判定，避免 CFStreamPropertyKey / CFHTTPMessage 在 Swift 下的桥接编译坑
-        // （kCFStreamPropertyHTTPResponseHeader 是 CFString，而 CFReadStreamCopyProperty 要 CFStreamPropertyKey，
-        //  且 CFHTTPMessage 的 Unmanaged 返回值在 Swift 下 also 易触发非法强转）。
+        // S3 失败返回 200 + XML <Error> body（非 4xx），所以无论状态码都必须先查 body。
         if bodyStr.contains("<Error>") {
             throw SunoError.uploadFailed("S3 上传被拒绝: \(bodyStr.prefix(200))")
         }
-        DebugLog.shared.info("S3上传", "CFNetwork 响应 body=\(responseBody.count)B 成功(204)")
-        return (204, bodyStr)
+        if statusCode == 0 {
+            // 极端：状态头读不到（CFNetwork 偶发），但无 <Error>，乐观判定成功
+            statusCode = 204
+        }
+        if (200...299).contains(statusCode) {
+            DebugLog.shared.info("S3上传", "CFNetwork 响应 status=\(statusCode) body=\(responseBody.count)B 成功")
+            return (statusCode, bodyStr)
+        } else {
+            throw SunoError.uploadFailed("S3 上传失败 status=\(statusCode): \(bodyStr.prefix(200))")
+        }
     }
 }
