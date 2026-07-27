@@ -60,6 +60,27 @@ final class SongStore: ObservableObject {
         save()
     }
 
+    /// 增量追加远程歌曲（用于无限滚动分页加载，保留本地下载路径）
+    func appendRemote(_ newSongs: [Song]) {
+        for r in newSongs {
+            if let idx = items.firstIndex(where: { $0.id == r.id }) {
+                var merged = r
+                merged.downloadedLocalPath = items[idx].downloadedLocalPath
+                items[idx] = merged
+            } else {
+                items.append(r)
+            }
+        }
+        // 去重后保持倒序（最新的在前）
+        var seen = Set<String>()
+        items = items.filter { s in
+            guard !seen.contains(s.id) else { return false }
+            seen.insert(s.id); return true
+        }
+        items.sort { $0.createdAt > $1.createdAt }
+        save()
+    }
+
     func remove(_ song: Song) {
         items.removeAll { $0.id == song.id }
         save()

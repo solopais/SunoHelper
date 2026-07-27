@@ -107,6 +107,17 @@ struct SunoAPI {
         }
     }
 
+    /// 完整计费信息（含账户类型推断）
+    func billing() async throws -> BillingInfo {
+        try await run {
+            let url = URL(string: "\(SunoAPI.base)/api/billing/info/")!
+            let req = makeRequest(url)
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            try Self.check(resp: resp, data: data)
+            return try JSONDecoder().decode(BillingInfo.self, from: data)
+        }
+    }
+
     // feed 可能返回 { clips:[...] } 外层，也可能直接是数组 —— 都兼容
     private static func decodeClips(_ data: Data) -> [SunoClip] {
         if let wrapped = try? JSONDecoder().decode(SunoFeedResponse.self, from: data) {
