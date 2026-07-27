@@ -59,6 +59,17 @@ struct SunoAPI {
     static let base = "https://studio-api.prod.suno.com"
     static let shared = SunoAPI()
 
+    /// 专用上传 session：避免 URLSession.shared 的 keep-alive 连接复用问题（-1005）
+    private static let uploadSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.urlCache = nil
+        config.httpMaximumConnectionsPerHost = 1
+        config.timeoutIntervalForRequest = 300
+        config.timeoutIntervalForResource = 600
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: config)
+    }()
+
     private func makeRequest(_ url: URL, method: String = "GET",
                              body: Data? = nil) -> URLRequest {
         var req = URLRequest(url: url)
@@ -125,60 +136,86 @@ struct SunoAPI {
     }
 
     /// Step 2: 上传文件到 S3（使用预签名 URL + form fields）
-    /// Step 2: 上传文件到 S3（使用预签名 URL + form fields）
-    /// 核心修复：multipart body 写入临时文件，用 URLSession.upload 流传输，
-    /// 避免 4.5MB 直接塞 httpBody 导致 URLSession 内存管理断连（-1005）
+    /// 修复 -1005：自定义 URLSession + Connection: close + 失败重试
     func uploadFileToS3(presignedURL: String, fields: [String: String],
                         fileData: Data, fileName: String, mimeType: String) async throws {
         try await run {
             let s3URL = URL(string: presignedURL)!
             let boundary = "Boundary-\(UUID().uuidString)"
 
-            // 构造 multipart body（和之前一样，但先写进临时文件）
+            // 从 fields 获取 Content-Type（确保 file 字段的 Content-Type 和 fields 里的一致）
+            let fieldsContentType = fields["Content-Type"] ?? mimeType
+
+            // 打印 fields 内容（帮助诊断 S3 拒绝原因）
+            DebugLog.shared.info("S3上传", "fields=\(fields.keys.sorted()) mimeType=\(mimeType) fieldsCT=\(fieldsContentType)")
+
+            // 构造 multipart body
             var body = Data()
             for (key, value) in fields {
                 body.append(Data("--\(boundary)\r\n".utf8))
                 body.append(Data("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n".utf8))
                 body.append(Data("\(value)\r\n".utf8))
             }
-            // 文件字段：文件名用 ASCII 临时名，避免中文编码问题
+            // file 字段（必须最后）
             body.append(Data("--\(boundary)\r\n".utf8))
             body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"upload.mp3\"\r\n".utf8))
-            body.append(Data("Content-Type: \(mimeType)\r\n\r\n".utf8))
+            body.append(Data("Content-Type: \(fieldsContentType)\r\n\r\n".utf8))
             body.append(fileData)
             body.append(Data("\r\n--\(boundary)--\r\n".utf8))
 
-            // 写入临时文件（URLSession.upload 从文件流传输，大文件稳定）
+            // 写入临时文件
             let tempDir = FileManager.default.temporaryDirectory
             let tempFile = tempDir.appendingPathComponent("suno_upload_\(UUID().uuidString).tmp")
             try body.write(to: tempFile)
-            defer {
-                try? FileManager.default.removeItem(at: tempFile)
-            }
 
+            DebugLog.shared.info("S3上传", "POST \(presignedURL.prefix(60))... body=\(body.count)B → 自定义session+Connection:close")
+
+            // 构造请求
             var req = URLRequest(url: s3URL)
             req.httpMethod = "POST"
             req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-            req.timeoutInterval = 300  // 大文件给 5 分钟
+            req.setValue("close", forHTTPHeaderField: "Connection")  // 关键：避免 keep-alive
+            req.timeoutInterval = 300
 
-            DebugLog.shared.info("S3上传", "POST \(presignedURL.prefix(60))... body=\(body.count)B → 临时文件流传输")
-
-            // 用 upload(for:fromFile:) 代替 data(for:)，大文件不走内存
-            let (data, resp) = try await URLSession.shared.upload(for: req, fromFile: tempFile)
-
-            if let http = resp as? HTTPURLResponse {
-                DebugLog.shared.info("S3上传", "响应状态: \(http.statusCode)")
-                if !(200...299).contains(http.statusCode) {
-                    let msg = String(data: data, encoding: .utf8) ?? "(empty)"
-                    DebugLog.shared.error("S3上传", "失败[\(http.statusCode)]: \(msg.prefix(300))")
-                    throw SunoError.uploadFailed("S3[\(http.statusCode)]: \(msg.prefix(200))")
+            // 第一次尝试
+            do {
+                let (data, resp) = try await Self.uploadSession.upload(for: req, fromFile: tempFile)
+                if let http = resp as? HTTPURLResponse {
+                    DebugLog.shared.info("S3上传", "响应状态: \(http.statusCode)")
+                    if !(200...299).contains(http.statusCode) {
+                        let msg = String(data: data, encoding: .utf8) ?? "(empty)"
+                        DebugLog.shared.error("S3上传", "失败[\(http.statusCode)]: \(msg.prefix(300))")
+                        try? FileManager.default.removeItem(at: tempFile)
+                        throw SunoError.uploadFailed("S3[\(http.statusCode)]: \(msg.prefix(200))")
+                    }
+                    DebugLog.shared.success("S3上传", "上传成功 (\(http.statusCode))")
                 }
-                DebugLog.shared.success("S3上传", "上传成功 (\(http.statusCode))")
+                try? FileManager.default.removeItem(at: tempFile)
+                return
+            } catch let error as URLError where error.code == .networkConnectionLost {
+                // -1005: keep-alive 连接被服务器关闭，等待后重试
+                DebugLog.shared.warn("S3上传", "首次失败(-1005 网络连接中断)，3秒后重试...")
+                try await Task.sleep(nanoseconds: 3_000_000_000)
+
+                // 第二次尝试（用新请求避免连接复用）
+                let (data, resp) = try await Self.uploadSession.upload(for: req, fromFile: tempFile)
+                if let http = resp as? HTTPURLResponse {
+                    DebugLog.shared.info("S3上传", "重试响应: \(http.statusCode)")
+                    if !(200...299).contains(http.statusCode) {
+                        let msg = String(data: data, encoding: .utf8) ?? "(empty)"
+                        DebugLog.shared.error("S3上传", "重试失败[\(http.statusCode)]: \(msg.prefix(300))")
+                        try? FileManager.default.removeItem(at: tempFile)
+                        throw SunoError.uploadFailed("S3[\(http.statusCode)]: \(msg.prefix(200))")
+                    }
+                    DebugLog.shared.success("S3上传", "重试上传成功 (\(http.statusCode))")
+                }
+                try? FileManager.default.removeItem(at: tempFile)
+                return
             }
         }
     }
 
-    /// 音频上传完整流程（Step 1 + Step 2），返回上传结果供后续 generate/cover 使用
+        /// 音频上传完整流程（Step 1 + Step 2），返回上传结果供后续 generate/cover 使用
     /// 这是新入口：替代旧的直接 multipart 到 generate 的错误方式
     func uploadAudioOnly(fileData: Data, fileName: String) async throws -> AudioUploadResult {
         // 推断文件扩展名
@@ -328,7 +365,7 @@ struct SunoAPI {
             var comps = URLComponents(string: "\(SunoAPI.base)/api/feed/v2")!
             comps.queryItems = [
                 URLQueryItem(name: "page", value: String(safePage)),
-                URLQueryItem(name: "num_results", value: "20")
+                URLQueryItem(name: "num_results", value: "50")
             ]
             let req = makeRequest(comps.url!)
             DebugLog.shared.info("音乐库", "GET /api/feed/v2?page=\(safePage)")
@@ -339,7 +376,7 @@ struct SunoAPI {
             try Self.check(resp: resp, data: data)
             if let wrapped = try? JSONDecoder().decode(SunoFeedResponse.self, from: data) {
                 let titles = wrapped.clips.prefix(3).compactMap { "[\($0.title ?? "?") \($0.created_at ?? "")]" }.joined(separator: ", ")
-                DebugLog.shared.info("音乐库", "page=\(safePage) clips=\(wrapped.clips.count) has_more=\(wrapped.has_more ?? false) top3=\(titles)")
+                DebugLog.shared.info("音乐库", "page=\(safePage) clips=\(wrapped.clips.count) has_more=\(wrapped.has_more ?? false) num_total=\(wrapped.num_total_results ?? -1) top3=\(titles)")
                 return wrapped
             }
             let arr = Self.decodeClips(data)
