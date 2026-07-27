@@ -150,7 +150,7 @@ struct GenerateView: View {
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 14)
-                        .background(busy ? AppTheme.surface2 : AnyShapeStyle(AppTheme.gradient()))
+                        .background(busy ? AnyShapeStyle(AppTheme.surface2) : AnyShapeStyle(AppTheme.gradient()))
                         .foregroundColor(.white)
                         .font(.headline)
                         .clipShape(RoundedRectangle(cornerRadius: 12))
@@ -376,7 +376,7 @@ private struct AdvancedModeSection: View {
                 }
             }
             .padding(.horizontal, 16)
-            .disclosureGroupStyle(InsetDisclosureGroupStyle())
+            // InsetDisclosureGroupStyle is iOS 16+; remove for iOS 15 compatibility
 
             // MARK: 风格区域
             DisclosureGroup(isExpanded: .constant(true)) {
@@ -404,7 +404,7 @@ private struct AdvancedModeSection: View {
                 }
             }
             .padding(.horizontal, 16)
-            .disclosureGroupStyle(InsetDisclosureGroupStyle())
+            // InsetDisclosureGroupStyle is iOS 16+; remove for iOS 15 compatibility
 
             // MARK: 更多选项（折叠面板）
             DisclosureGroup(isExpanded: $showAdvancedOptions) {
@@ -465,7 +465,7 @@ private struct AdvancedModeSection: View {
                 }
             }
             .padding(.horizontal, 16)
-            .disclosureGroupStyle(InsetDisclosureGroupStyle())
+            // InsetDisclosureGroupStyle is iOS 16+; remove for iOS 15 compatibility
         }
     }
 
