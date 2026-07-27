@@ -43,7 +43,7 @@ struct LibraryView: View {
                 }
             }
             .background(AppTheme.bg)
-            .navigationTitle("音乐库")
+            .navigationTitle(totalCount != nil ? "音乐库 (\(totalCount!))" : "音乐库")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
@@ -80,18 +80,17 @@ struct LibraryView: View {
         }
         await MainActor.run {
             refreshing = true
-            currentPage = 0
+            currentPage = 1   // Suno API page 从 1 开始
             hasMorePages = true
             allLoaded = false
             loadingMore = false
         }
 
         do {
-            let resp = try await SunoAPI.shared.library(page: 0)
+            let resp = try await SunoAPI.shared.library(page: 1)
             let songs = resp.clips.map { Song.from(clip: $0) }
             await MainActor.run {
                 store.mergeRemote(songs)
-                currentPage = 1
                 hasMorePages = resp.has_more == true
                 allLoaded = !hasMorePages
                 totalCount = resp.num_total_results

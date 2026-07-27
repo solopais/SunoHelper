@@ -31,6 +31,9 @@ struct GenerateView: View {
     @State private var message = ""
     @State private var showWebViewCreate = false
     @State private var captchaBlocked = false
+    @State private var showAudioPicker = false       // 音频文件选择器
+    @State private var pickedAudioURL: URL?          // 已选音频文件路径
+    @State private var pickedAudioName: String?      // 已选音频文件名
 
     // === 续写模式 ===
     private let extendClipID: String?
@@ -106,7 +109,10 @@ struct GenerateView: View {
                             weirdness: $weirdness,
                             styleWeight: $styleWeight,
                             negativeTags: $negativeTags,
-                            showAdvancedOptions: $showAdvancedOptions
+                            showAdvancedOptions: $showAdvancedOptions,
+                            planType: planType,
+                            onPickAudio: { showAudioPicker = true },
+                            pickedAudioName: pickedAudioName
                         )
                     }
 
@@ -180,6 +186,23 @@ struct GenerateView: View {
             .navigationBarTitleDisplayMode(.inline)
             .fullScreenCover(isPresented: $showWebViewCreate) {
                 CreateWebView()
+            }
+            .fileImporter(
+                isPresented: $showAudioPicker,
+                allowedContentTypes: [.audio],
+                allowsMultipleSelection: false
+            ) { result in
+                switch result {
+                case .success(let urls):
+                    if let url = urls.first {
+                        pickedAudioURL = url
+                        pickedAudioName = url.lastPathComponent
+                        // 切换到自定义模式（音频上传需要用 prompt/generation_type=AUDIO_UPLOAD）
+                        createMode = .advanced
+                    }
+                case .failure(let err):
+                    message = "选择文件失败：\(err.localizedDescription)"
+                }
             }
             .onAppear { checkPlan() }
         }
@@ -341,6 +364,12 @@ private struct AdvancedModeSection: View {
     @Binding var styleWeight: Double
     @Binding var negativeTags: String
     @Binding var showAdvancedOptions: Bool
+    var planType: SunoPlanType = .unknown
+    var onPickAudio: (() -> Void)? = nil
+    var pickedAudioName: String? = nil
+
+    /// 免费版是否锁定高级参数（怪异/风格影响固定 50%）
+    private var isFreePlan: Bool { planType == .free }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -348,12 +377,28 @@ private struct AdvancedModeSection: View {
             // MARK: 功能按钮行（+音频 +配音 +灵感来源）
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 10) {
-                    FeatureChip(icon: "waveform", label: "音频", isNew: false)
-                    FeatureChip(icon: "mic.fill", label: "配音", isNew: true)
-                    FeatureChip(icon: "lightbulb", label: "灵感来源", isNew: false)
+                    // 音频上传（免费版可用）— 点击弹出文件选择器
+                    FeatureChip(icon: "waveform", label: "音频", isNew: false, isLocked: false, action: onPickAudio)
+                    // 配音 — Pro 专属（AI 声音克隆/自定义人声，上传声音样本或从已有歌曲提取音色）
+                    FeatureChip(icon: "mic.fill", label: "配音", isNew: true, isLocked: isFreePlan, lockHint: "Pro 专属")
+                    // 灵感来源 — Pro 专属（AI 推荐提示词/风格组合/热门趋势建议）
+                    FeatureChip(icon: "lightbulb", label: "灵感来源", isNew: false, isLocked: isFreePlan, lockHint: "Pro 专属")
                 }
             }
             .padding(.horizontal, 16)
+
+            // 已选音频文件名显示
+            if let name = pickedAudioName {
+                HStack(spacing: 6) {
+                    Image(systemName: "doc.fill").font(.caption).foregroundColor(AppTheme.accent)
+                    Text(name)
+                        .font(.caption).foregroundColor(AppTheme.textSecondary).lineLimit(1)
+                    Button(action: { /* TODO: 清除选择 */ }) {
+                        Image(systemName: "xmark.circle.fill").font(.caption).foregroundColor(AppTheme.textSecondary)
+                    }
+                }
+                .padding(.horizontal, 16).padding(.vertical, 4)
+            }
 
             // MARK: 歌词区域
             DisclosureGroup(isExpanded: .constant(true)) {
@@ -435,11 +480,11 @@ private struct AdvancedModeSection: View {
                         }
                     }
 
-                    // 怪异滑块
-                    SliderRow(label: "怪异", value: $weirdness, icon: "questionmark.circle")
+                    // 怪异滑块（免费版锁定 50%）
+                    SliderRow(label: "怪异", value: $weirdness, icon: "questionmark.circle", locked: isFreePlan)
 
-                    // 风格影响滑块
-                    SliderRow(label: "风格影响", value: $styleWeight, icon: "paintbrush")
+                    // 风格影响滑块（免费版锁定 50%）
+                    SliderRow(label: "风格影响", value: $styleWeight, icon: "paintbrush", locked: isFreePlan)
 
                     // Song Title
                     VStack(alignment: .leading, spacing: 6) {
@@ -516,21 +561,37 @@ private struct FeatureChip: View {
     let icon: String
     let label: String
     let isNew: Bool
+    var isLocked: Bool = false
+    var lockHint: String = ""
+    var action: (() -> Void)? = nil
 
     var body: some View {
-        HStack(spacing: 5) {
-            Image(systemName: icon).font(.caption)
-            Text(label).font(.caption)
-            if isNew {
-                Text("新").font(.system(size: 9)).fontWeight(.bold)
-                    .foregroundColor(.white).padding(.horizontal, 4).padding(.vertical, 1)
-                    .background(Color.pink).clipShape(Capsule())
+        Button(action: {
+            if !isLocked { action?() }
+        }) {
+            HStack(spacing: 5) {
+                Image(systemName: icon).font(.caption)
+                Text(label).font(.caption)
+                if isNew && !isLocked {
+                    Text("新").font(.system(size: 9)).fontWeight(.bold)
+                        .foregroundColor(.white).padding(.horizontal, 4).padding(.vertical, 1)
+                        .background(Color.pink).clipShape(Capsule())
+                }
+                if isLocked {
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 8)).foregroundColor(AppTheme.textSecondary)
+                    if !lockHint.isEmpty {
+                        Text(lockHint).font(.system(size: 8)).foregroundColor(AppTheme.textSecondary)
+                    }
+                }
             }
+            .padding(.horizontal, 12).padding(.vertical, 7)
+            .background(isLocked ? AppTheme.surface2 : AppTheme.surface)
+            .foregroundColor(isLocked ? AppTheme.textSecondary : AppTheme.text)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .opacity(isLocked ? 0.7 : 1.0)
         }
-        .padding(.horizontal, 12).padding(.vertical, 7)
-        .background(AppTheme.surface)
-        .foregroundColor(AppTheme.text)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .disabled(isLocked)
     }
 }
 
@@ -611,6 +672,7 @@ private struct SliderRow: View {
     let label: String
     @Binding var value: Double
     let icon: String
+    var locked: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -620,12 +682,24 @@ private struct SliderRow: View {
                     Text(label).font(.subheadline).foregroundColor(AppTheme.textSecondary)
                 }
                 Spacer()
-                Text("\(Int(value))%")
-                    .font(.caption).monospacedDigit().foregroundColor(AppTheme.accent)
+                HStack(spacing: 3) {
+                    Text("\(Int(value))%")
+                        .font(.caption).monospacedDigit().foregroundColor(AppTheme.accent)
+                    if locked {
+                        Image(systemName: "lock.fill")
+                            .font(.system(size: 9)).foregroundColor(AppTheme.textSecondary)
+                    }
+                }
             }
             Slider(value: $value, in: 0...100, step: 1)
                 .accentColor(AppTheme.accent)
                 .tint(AppTheme.accent)
+                .disabled(locked)
+                .opacity(locked ? 0.6 : 1.0)
+            if locked {
+                Text("免费版固定为 50%")
+                    .font(.caption2).foregroundColor(AppTheme.textSecondary)
+            }
         }
     }
 }

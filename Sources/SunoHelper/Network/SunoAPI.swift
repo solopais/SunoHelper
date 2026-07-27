@@ -80,10 +80,14 @@ struct SunoAPI {
     }
 
     /// 拉取「我的音乐库」——当前账户所有歌曲（分页）
+    /// 注意：Suno feed/v2 的 page 参数从 1 开始（非 0）
     func library(page: Int) async throws -> SunoFeedResponse {
         try await run {
+            let safePage = max(page, 1)  // API page 从 1 开始
             var comps = URLComponents(string: "\(SunoAPI.base)/api/feed/v2")!
-            comps.queryItems = [URLQueryItem(name: "page", value: String(page))]
+            comps.queryItems = [
+                URLQueryItem(name: "page", value: String(safePage))
+            ]
             let req = makeRequest(comps.url!)
             let (data, resp) = try await URLSession.shared.data(for: req)
             try Self.check(resp: resp, data: data)
@@ -92,7 +96,7 @@ struct SunoAPI {
             }
             let arr = Self.decodeClips(data)
             return SunoFeedResponse(clips: arr, num_total_results: arr.count,
-                                    current_page: page, has_more: false)
+                                    current_page: safePage, has_more: false)
         }
     }
 

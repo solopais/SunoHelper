@@ -164,9 +164,9 @@ struct SettingsView: View {
     /// 可用模型描述文本
     var availableModelsText: String {
         if planType == .free {
-            return "v4.5-all / v4 / v3.5（免费版）"
+            return "v4.5-all / v4（免费版）"
         }
-        return "全部 7 个模型（含 v5.5 Pro）"
+        return "全部 6 个模型（含 v5.5 Pro）"
     }
 }
 

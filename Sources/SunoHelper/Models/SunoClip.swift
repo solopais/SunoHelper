@@ -100,18 +100,24 @@ struct BillingInfo: Codable {
     var total_credits_left: Int? { credits }
 
     /// 根据额度推断账户类型
+    /// Suno 计费规则：免费版 monthly_limit=50或100，Pro=500，Premier=10000+
     var inferredPlan: SunoPlanType {
         if let limit = monthly_limit {
             if limit >= 10000 { return .premier }
             if limit >= 500  { return .pro }
-            if limit <= 50   { return .free }
+            // <= 100 即免费版（含 legacy 免费 50 和当前免费 100）
+            return .free
         }
-        if let type = plan_type {
-            return SunoPlanType(rawValue: type) ?? .unknown
+        // 无 monthly_limit 字段时兜底：看 plan_type
+        if let type = plan_type, !type.isEmpty {
+            let t = type.lowercased()
+            if t.contains("premier") { return .premier }
+            if t.contains("pro")      { return .pro }
+            return .free
         }
-        // 兜底：根据 credits 推断
-        if let c = credits, c > 200 { return .pro }
-        return .free
+        // 最后兜底
+        if let c = credits, c <= 100 { return .free }
+        return .unknown
     }
 }
 
@@ -126,16 +132,16 @@ struct SunoModel: Identifiable, Hashable {
 }
 
 enum SunoModels {
+    /// 官方模型列表（与 suno.com/create 下拉完全一致，共 6 个）
     static let all: [SunoModel] = [
         SunoModel(label: "v5.5 Pro",    mv: "chirp-fenix",      maxSeconds: 480, requiresPro: true),
         SunoModel(label: "v5 Pro",      mv: "chirp-crow",       maxSeconds: 480, requiresPro: true),
         SunoModel(label: "v4.5+ Pro",   mv: "chirp-bluejay",    maxSeconds: 480, requiresPro: true),
-        SunoModel(label: "v4.5-all",    mv: "chirp-auk-turbo",  maxSeconds: 240, requiresPro: false),
         SunoModel(label: "v4.5 Pro",    mv: "chirp-auk",        maxSeconds: 240, requiresPro: true),
+        SunoModel(label: "v4.5-all",    mv: "chirp-auk-turbo",  maxSeconds: 240, requiresPro: false),
         SunoModel(label: "v4 Pro",      mv: "chirp-v4",         maxSeconds: 150, requiresPro: false),
-        SunoModel(label: "v3.5",        mv: "chirp-v3-5",       maxSeconds: 150, requiresPro: false),
     ]
-    static let defaultMV = "chirp-crow"
+    static let defaultMV = "chirp-auk-turbo"   // 默认选中 v4.5-all（最佳免费模型）
 
     static func label(for mv: String) -> String {
         all.first { $0.mv == mv }?.label ?? mv
