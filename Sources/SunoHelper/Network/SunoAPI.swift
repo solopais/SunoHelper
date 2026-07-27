@@ -90,21 +90,21 @@ struct SunoAPI {
 
             for (key, value) in formFields {
                 if let v = value, !v.isEmpty {
-                    body.append("--\(boundary)\r\n")
-                    body.append("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n")
-                    body.append("\(v)\r\n")
+                    body.append(Data("--\(boundary)\r\n".utf8))
+                    body.append(Data("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n".utf8))
+                    body.append(Data("\(v)\r\n".utf8))
                 }
             }
 
             // 文件字段
-            body.append("--\(boundary)\r\n")
-            body.append("Content-Disposition: form-data; name=\"audio_file\"; filename=\"\(fileName)\"\r\n")
-            body.append("Content-Type: \(mimeType)\r\n\r\n")
+            body.append(Data("--\(boundary)\r\n".utf8))
+            body.append(Data("Content-Disposition: form-data; name=\"audio_file\"; filename=\"\(fileName)\"\r\n".utf8))
+            body.append(Data("Content-Type: \(mimeType)\r\n\r\n".utf8))
             body.append(fileData)
-            body.append("\r\n")
+            body.append(Data("\r\n".utf8))
 
             // 结束标记
-            body.append("--\(boundary)--\r\n")
+            body.append(Data("--\(boundary)--\r\n".utf8))
 
             // 构建请求
             var req = URLRequest(url: apiURL)
