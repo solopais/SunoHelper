@@ -82,8 +82,8 @@ struct LibraryView: View {
 
     /// 完全重新加载（下拉刷新 / 首次进入 / 创作完成通知）
     /// 策略：先加载第 1 页立即展示，然后后台渐进式加载剩余页面
-    /// 注意：Suno API 的 num_total_results 始终返回 21（不可靠），不能用来判断总数！
-    ///       只能依赖 has_more + clips 是否为空来判断是否还有更多数据
+    /// 重要：不再依赖 has_more（API 返回 has_more=false 但 num_total=1571，矛盾）
+    ///       改为根据 num_total_results 和已加载数量判断是否继续翻页
     func fullReload() async {
         guard session.isLoggedIn else {
             await MainActor.run { refreshMsg = "请先登录 Suno 账户" }
@@ -101,39 +101,58 @@ struct LibraryView: View {
             // 先加载第 1 页，立即展示（用户 1 秒内看到数据）
             let resp = try await SunoAPI.shared.library(page: 1)
             let songs = resp.clips.map { Song.from(clip: $0) }
-            var lastHasMore = resp.has_more == true && !songs.isEmpty
+            let numTotal = resp.num_total_results ?? 0
+            // 不再依赖 has_more！根据 num_total 和已加载数量判断
+            var lastShouldContinue = !songs.isEmpty && (numTotal == 0 || songs.count < numTotal)
+
+            DebugLog.shared.info("音乐库", "fullReload page=1 clips=\(songs.count) num_total=\(numTotal) has_more=\(resp.has_more ?? false) → shouldContinue=\(lastShouldContinue)")
 
             await MainActor.run {
                 if !songs.isEmpty {
                     store.replaceRemote(songs)
                 }
                 currentPage = 2
-                hasMorePages = lastHasMore
-                allLoaded = !lastHasMore
+                hasMorePages = lastShouldContinue
+                allLoaded = !lastShouldContinue
                 refreshing = false  // 第 1 页已展示，停止全屏刷新
             }
 
-            // 同步加载第 2-3 页，追加到列表（用户 2-3 秒内看到 ~60 首）
-            if lastHasMore {
+            // 同步加载第 2-3 页，追加到列表
+            if lastShouldContinue {
                 for page in 2...3 {
                     try? await Task.sleep(nanoseconds: 800_000_000)  // 页间间隔防 429
                     do {
                         let resp2 = try await SunoAPI.shared.library(page: page)
                         let songs2 = resp2.clips.map { Song.from(clip: $0) }
-                        lastHasMore = resp2.has_more == true && !songs2.isEmpty
 
-                        await MainActor.run {
-                            if !songs2.isEmpty {
-                                store.appendRemote(songs2)
-                            }
-                            currentPage = page + 1
-                            hasMorePages = lastHasMore
-                            allLoaded = !lastHasMore
+                        // 去重：检查新歌曲是否已存在
+                        let existingIDs = Set(store.items.map { $0.id })
+                        let uniqueSongs = songs2.filter { !existingIDs.contains($0.id) }
+
+                        let numTotal2 = resp2.num_total_results ?? 0
+                        // 如果返回的歌曲全部重复，说明分页不工作
+                        if songs2.isEmpty {
+                            lastShouldContinue = false
+                        } else if uniqueSongs.isEmpty {
+                            DebugLog.shared.warn("音乐库", "page=\(page) 返回\(songs2.count)首但全部重复，分页可能不工作，停止")
+                            lastShouldContinue = false
+                        } else {
+                            lastShouldContinue = numTotal2 == 0 || (store.items.count + uniqueSongs.count) < numTotal2
                         }
 
-                        if !lastHasMore || songs2.isEmpty { break }
+                        DebugLog.shared.info("音乐库", "fullReload page=\(page) clips=\(songs2.count) unique=\(uniqueSongs.count) num_total=\(numTotal2) → shouldContinue=\(lastShouldContinue)")
+
+                        await MainActor.run {
+                            if !uniqueSongs.isEmpty {
+                                store.appendRemote(uniqueSongs)
+                            }
+                            currentPage = page + 1
+                            hasMorePages = lastShouldContinue
+                            allLoaded = !lastShouldContinue
+                        }
+
+                        if !lastShouldContinue || songs2.isEmpty { break }
                     } catch {
-                        // 第 2-3 页失败：显示错误但保留已加载的
                         DebugLog.shared.error("音乐库", "page=\(page) 失败: \(error.localizedDescription)")
                         await MainActor.run {
                             refreshMsg = "第\(page)页加载失败: \(error.localizedDescription.prefix(100))。已加载\(store.items.count)首"
@@ -143,7 +162,7 @@ struct LibraryView: View {
                 }
             }
 
-            // 3 页加载完后，后台继续预加载剩余（不阻塞用户浏览）
+            // 3 页加载完后，后台继续预加载剩余
             if hasMorePages && !allLoaded {
                 Task { await preloadRemaining() }
             }
@@ -168,12 +187,12 @@ struct LibraryView: View {
     }
 
     /// 后台预加载剩余页面（用户可同时浏览已加载的歌曲）
-    /// 注意：每页间隔 1.2 秒，避免触发 Suno API 的 429 限流（实测 14 页连续请求就限流）
+    /// 不再依赖 has_more，根据 num_total_results 和已加载数量判断
+    /// 加去重逻辑：如果返回歌曲全部重复，说明分页不工作，停止加载
     func preloadRemaining() async {
         guard session.isLoggedIn else { return }
         guard !loadingMore, !allLoaded, hasMorePages else { return }
 
-        // 用局部变量控制循环，避免 @State 在后台线程的数据竞争
         var page = currentPage
         var hasMore = hasMorePages
 
@@ -182,15 +201,30 @@ struct LibraryView: View {
         var consecutiveErrors = 0
         while hasMore {
             do {
-                try? await Task.sleep(nanoseconds: 1_200_000_000)  // 每页间隔 1.2 秒防 429
+                try? await Task.sleep(nanoseconds: 1_200_000_000)
                 let resp = try await SunoAPI.shared.library(page: page)
                 let newSongs = resp.clips.map { Song.from(clip: $0) }
-                let hadNew = !newSongs.isEmpty
-                hasMore = resp.has_more == true && hadNew
+                let numTotal = resp.num_total_results ?? 0
+
+                // 去重
+                let existingIDs = Set(store.items.map { $0.id })
+                let uniqueSongs = newSongs.filter { !existingIDs.contains($0.id) }
+
+                if newSongs.isEmpty {
+                    hasMore = false
+                } else if uniqueSongs.isEmpty {
+                    DebugLog.shared.warn("音乐库", "preload page=\(page) 返回\(newSongs.count)首但全部重复，停止")
+                    hasMore = false
+                } else {
+                    hasMore = numTotal == 0 || (store.items.count + uniqueSongs.count) < numTotal
+                }
+
+                DebugLog.shared.info("音乐库", "preload page=\(page) clips=\(newSongs.count) unique=\(uniqueSongs.count) total_loaded=\(store.items.count + uniqueSongs.count)/\(numTotal)")
+
                 page += 1
 
                 await MainActor.run {
-                    if hadNew { store.appendRemote(newSongs) }
+                    if !uniqueSongs.isEmpty { store.appendRemote(uniqueSongs) }
                     currentPage = page
                     hasMorePages = hasMore
                     if !hasMore { allLoaded = true }
@@ -206,10 +240,9 @@ struct LibraryView: View {
                     }
                     return
                 }
-                // 429 限流时等待更长时间重试
                 if case .http(let code, _) = error, code == 429 {
-                    consecutiveErrors = 0  // 429 不算致命错误，等待后重试
-                    try? await Task.sleep(nanoseconds: 5_000_000_000)  // 429 时等 5 秒
+                    consecutiveErrors = 0
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
                     continue
                 }
                 if consecutiveErrors >= 3 {
@@ -231,6 +264,7 @@ struct LibraryView: View {
     }
 
     /// 加载下一页（无限滚动触发）
+    /// 不再依赖 has_more，根据 num_total_results 和已加载数量判断
     func loadNextPage() async {
         guard !loadingMore, !allLoaded, hasMorePages, session.isLoggedIn else { return }
         await MainActor.run { loadingMore = true }
@@ -238,19 +272,32 @@ struct LibraryView: View {
         do {
             let resp = try await SunoAPI.shared.library(page: currentPage)
             let newSongs = resp.clips.map { Song.from(clip: $0) }
-            let hadNew = !newSongs.isEmpty
+            let numTotal = resp.num_total_results ?? 0
+
+            // 去重
+            let existingIDs = Set(store.items.map { $0.id })
+            let uniqueSongs = newSongs.filter { !existingIDs.contains($0.id) }
+
+            var shouldContinue = false
+            if newSongs.isEmpty {
+                shouldContinue = false
+            } else if uniqueSongs.isEmpty {
+                DebugLog.shared.warn("音乐库", "loadNextPage page=\(currentPage) 全部重复，停止")
+                shouldContinue = false
+            } else {
+                shouldContinue = numTotal == 0 || (store.items.count + uniqueSongs.count) < numTotal
+            }
+
             await MainActor.run {
-                if hadNew { store.appendRemote(newSongs) }
+                if !uniqueSongs.isEmpty { store.appendRemote(uniqueSongs) }
                 currentPage += 1
-                // 只依赖 has_more + 是否有新数据（不使用 num_total_results）
-                hasMorePages = resp.has_more == true && hadNew
-                if !hasMorePages || !hadNew { allLoaded = true }
+                hasMorePages = shouldContinue
+                if !shouldContinue { allLoaded = true }
             }
         } catch let error as SunoError {
             if case .authExpired = error {
                 await MainActor.run { refreshMsg = "登录已过期，请重新登录" }
             } else if case .http(let code, _) = error, code == 429 {
-                // 429 限流：静默处理，下次滚动重试
                 await MainActor.run { loadingMore = false }
                 return
             } else {
@@ -262,7 +309,7 @@ struct LibraryView: View {
 
         await MainActor.run { loadingMore = false }
     }
-}
+
 
 // MARK: - 空态视图
 private struct EmptyLibraryView: View {
