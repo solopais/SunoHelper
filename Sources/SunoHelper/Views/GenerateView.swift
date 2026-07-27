@@ -308,28 +308,47 @@ struct GenerateView: View {
                     stubs = try await SunoAPI.shared.generate(payload: buildPayload())
                 }
                 let ids = stubs.map { $0.id }
-                await MainActor.run { message = "已提交，Suno 创作中（\(ids.count) 首）…" }
+                await MainActor.run { message = "已提交，Suno 创作中（\(ids.count) 首）…轮询进度中…" }
 
+                // 轮询生成状态（容错：单次网络失败不终止轮询）
                 var finished = false
                 var rounds = 0
-                while !finished && rounds < 60 {
+                var consecutiveErrors = 0
+                while !finished && rounds < 90 {       // 90 × 4s = 最长 6 分钟
                     try await Task.sleep(nanoseconds: 4_000_000_000)
                     rounds += 1
-                    let clips = try await SunoAPI.shared.feed(ids: ids)
-                    for c in clips {
-                        await MainActor.run { store.update(Song.from(clip: c)) }
+
+                    // 单次 feed 查询失败仅记录，不终止轮询（网络抖动/临时 401 不应杀死整个任务）
+                    do {
+                        let clips = try await SunoAPI.shared.feed(ids: ids)
+                        consecutiveErrors = 0             // 成功则重置错误计数
+                        for c in clips {
+                            await MainActor.run { store.update(Song.from(clip: c)) }
+                        }
+                        finished = clips.allSatisfy { ($0.status ?? "streaming") == "complete" || ($0.status ?? "") == "error" }
+                    } catch {
+                        consecutiveErrors += 1
+                        // 连续 5 次失败才放弃（避免死循环），否则继续等下次重试
+                        guard consecutiveErrors >= 5 else {
+                            await MainActor.run { message = "轮询中…(\(rounds) \(consecutiveErrors)次暂失败，继续等待)" }
+                            continue
+                        }
+                        throw error   // 连续多次失败，抛出给外层 catch
                     }
-                    finished = clips.allSatisfy { ($0.status ?? "streaming") == "complete" || ($0.status ?? "") == "error" }
+
+                    await MainActor.run { message = finished ? "✅ 创作完成！" : "创作中…(\(rounds)×4s)" }
                 }
 
                 await MainActor.run {
                     busy = false
                     if finished {
-                        message = "✅ 完成！已保存到音乐库"
+                        message = "✅ 完成！已保存到音乐库，下拉刷新查看"
                         resetForm()
                     } else {
                         message = "仍在创作中，可到「音乐库」等待或下拉刷新"
                     }
+                    // 无论成功/超时都通知音乐库刷新（新歌曲可能已在服务端完成）
+                    NotificationCenter.default.post(name: Notification.Name("SunoReloadLibrary"), object: nil)
                 }
             } catch {
                 await MainActor.run {
@@ -338,6 +357,8 @@ struct GenerateView: View {
                     if let se = error as? SunoError, case .captcha = se {
                         captchaBlocked = true
                     }
+                    // 即使失败也尝试刷新音乐库（部分歌曲可能已提交成功）
+                    NotificationCenter.default.post(name: Notification.Name("SunoReloadLibrary"), object: nil)
                 }
             }
         }

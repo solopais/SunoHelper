@@ -65,8 +65,9 @@ struct SunoAPI {
             let boundary = "Boundary-\(UUID().uuidString)"
             var body = Data()
 
-            // 普通文本字段（从 payload 提取）
-            let formFields: [(String, String?)] = [
+            // 音频上传模式只发核心字段（避免 weirdness/style_weight/audio_weight/task/token 等多余字段
+            // 导致服务端 400/断连；网页版实测 AUDIO 模式仅接受以下字段）
+            let audioFields: [(String, String?)] = [
                 ("make_instrumental", "\(payload.make_instrumental)"),
                 ("mv", payload.mv),
                 ("generation_type", payload.generation_type),
@@ -76,14 +77,9 @@ struct SunoAPI {
                 ("title", payload.title),
                 ("negative_tags", payload.negative_tags),
                 ("vocal_gender", payload.vocal_gender),
-                ("weirdness_constraint", payload.weirdness_constraint.map { "\($0)" }),
-                ("style_weight", payload.style_weight.map { "\($0)" }),
-                ("audio_weight", payload.audio_weight.map { "\($0)" }),
-                ("task", payload.task),
-                ("token", payload.token),
             ]
 
-            for (key, value) in formFields {
+            for (key, value) in audioFields {
                 if let v = value, !v.isEmpty {
                     body.append(Data("--\(boundary)\r\n".utf8))
                     body.append(Data("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n".utf8))
@@ -91,9 +87,10 @@ struct SunoAPI {
                 }
             }
 
-            // 文件字段
+            // 文件字段（文件名做 percent-encoding，处理中文等非 ASCII 字符）
+            let safeName = encodedFileName(fileName)
             body.append(Data("--\(boundary)\r\n".utf8))
-            body.append(Data("Content-Disposition: form-data; name=\"audio_file\"; filename=\"\(fileName)\"\r\n".utf8))
+            body.append(Data("Content-Disposition: form-data; name=\"audio_file\"; filename=\"\(safeName)\"\r\n".utf8))
             body.append(Data("Content-Type: \(mimeType)\r\n\r\n".utf8))
             body.append(fileData)
             body.append(Data("\r\n".utf8))
@@ -101,23 +98,32 @@ struct SunoAPI {
             // 结束标记
             body.append(Data("--\(boundary)--\r\n".utf8))
 
-            // 构建请求
+            // 构建请求（显式 Content-Length 防止大文件上传时连接被意外断开）
             var req = URLRequest(url: apiURL)
             req.httpMethod = "POST"
             req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+            req.setValue("\(body.count)", forHTTPHeaderField: "Content-Length")
             req.setValue("https://suno.com/", forHTTPHeaderField: "Referer")
             req.setValue("https://suno.com", forHTTPHeaderField: "Origin")
             for (k, v) in SunoSession.shared.authHeaders() {
                 req.setValue(v, forHTTPHeaderField: k)
             }
             req.httpBody = body
-            req.timeoutInterval = 120  // 上传可能需要更长时间
+            req.timeoutInterval = 300  // 大文件/弱网环境给足 5 分钟
 
             let (data, resp) = try await URLSession.shared.data(for: req)
             try Self.check(resp: resp, data: data)
             let decoded = try JSONDecoder().decode(GenerateResponse.self, from: data)
             return decoded.clips
         }
+    }
+
+    /// 对文件名做 percent-encoding，确保中文名在 multipart Content-Disposition 中合法
+    private func encodedFileName(_ original: String) -> String {
+        if original.allSatisfy({ $0.isASCII && !$0.controlCharacter }) {
+            return original
+        }
+        return original.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? original
     }
 
     /// 音频上传 + 生成一体接口（multipart/form-data）— 从文件 URL 读取（兼容旧调用）

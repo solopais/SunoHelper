@@ -81,7 +81,9 @@ struct LibraryView: View {
         }
     }
 
-    /// 完全重新加载（下拉刷新 / 首次进入）
+    /// 完全重新加载（下拉刷新 / 首次进入 / 创作完成通知）
+    /// 策略：先连续加载前 3 页（~60 首），让用户立即看到足够多的歌曲；
+    /// 然后后台继续加载剩余页面，避免只显示第一页的 ~20 首导致"1569 首但列表不全"
     func fullReload() async {
         guard session.isLoggedIn else {
             await MainActor.run { refreshMsg = "请先登录 Suno 账户" }
@@ -95,21 +97,78 @@ struct LibraryView: View {
             loadingMore = false
         }
 
-        do {
-            let resp = try await SunoAPI.shared.library(page: 1)
-            let songs = resp.clips.map { Song.from(clip: $0) }
-            await MainActor.run {
-                store.replaceRemote(songs)   // fullReload 先清空再写入，避免旧缓存导致数量不准
-                currentPage = 2       // page=1 已加载，下一页从 2 开始
-                hasMorePages = resp.has_more == true
-                allLoaded = !hasMorePages
-                totalCount = resp.num_total_results
+        // 连续加载前 3 页（或直到无更多数据），合并后一次性写入 store
+        var allSongs: [Song] = []
+        let initialPages = 3
+        var actualLoadedPages = 0
+
+        for page in 1...initialPages {
+            do {
+                let resp = try await SunoAPI.shared.library(page: page)
+                let songs = resp.clips.map { Song.from(clip: $0) }
+                if songs.isEmpty { break }           // 空页说明到底了
+                allSongs.append(contentsOf: songs)
+                actualLoadedPages += 1
+                await MainActor.run {
+                    totalCount = resp.num_total_results
+                    // 只要还有数据就继续（不依赖 has_more，该字段可能不准）
+                    hasMorePages = resp.has_more == true || (totalCount != nil && allSongs.count < totalCount!)
+                }
+                if resp.has_more != true && (totalCount == nil || allSongs.count >= totalCount!) { break }
+            } catch {
+                // 单页失败不终止整体刷新，已加载的数据仍然有效
+                await MainActor.run { refreshMsg = "第 \(page) 页加载失败，已加载前 \(allSongs.count) 首" }
+                break
             }
-        } catch {
-            await MainActor.run { refreshMsg = "拉取失败：\(error.localizedDescription)" }
         }
 
-        await MainActor.run { refreshing = false }
+        await MainActor.run {
+            if !allSongs.isEmpty {
+                store.replaceRemote(allSongs)
+            }
+            currentPage = actualLoadedPages + 1      // 下一页从已加载的下一页开始
+            allLoaded = !hasMorePages               // 根据实际判断是否全部加载完
+            refreshing = false
+        }
+
+        // 前台预加载：如果还有更多数据且未全部加载，继续在后台拉取剩余页面
+        if hasMorePages && !allLoaded {
+            Task { await preloadRemaining() }
+        }
+    }
+
+    /// 后台预加载剩余页面（用户可同时浏览已加载的歌曲）
+    func preloadRemaining() async {
+        // 防止重复触发
+        guard !loadingMore, !allLoaded, hasMorePages else { return }
+        await MainActor.run { loadingMore = true }
+
+        while hasMorePages && !allLoaded {
+            do {
+                let resp = try await SunoAPI.shared.library(page: currentPage)
+                let newSongs = resp.clips.map { Song.from(clip: $0) }
+                let hadNew = !newSongs.isEmpty
+                await MainActor.run {
+                    if hadNew { store.appendRemote(newSongs) }
+                    currentPage += 1
+                    // 智能判断：已知总数时以总数为准；否则依赖 has_more
+                    if let total = totalCount {
+                        hasMorePages = store.items.count < total
+                    } else {
+                        hasMorePages = resp.has_more == true && hadNew
+                    }
+                    allLoaded = !hasMorePages || !hadNew
+                }
+                // 每页之间稍作间隔，避免请求过于密集
+                try? await Task.sleep(nanoseconds: 300_000_000)  // 300ms
+            } catch {
+                // 预加载失败静默重试下次滚动触发
+                await MainActor.run { loadingMore = false }
+                return
+            }
+        }
+
+        await MainActor.run { loadingMore = false; allLoaded = true }
     }
 
     /// 加载下一页（无限滚动触发）
@@ -124,7 +183,12 @@ struct LibraryView: View {
             await MainActor.run {
                 if hadNew { store.appendRemote(newSongs) }
                 currentPage += 1
-                hasMorePages = resp.has_more == true && hadNew
+                // 智能判断：已知 totalCount 时以"已加载数 < 总数"为准，不依赖不可靠的 has_more
+                if let total = totalCount {
+                    hasMorePages = store.items.count < total
+                } else {
+                    hasMorePages = resp.has_more == true && hadNew
+                }
                 if !hasMorePages || !hadNew { allLoaded = true }
                 totalCount = resp.num_total_results
             }
