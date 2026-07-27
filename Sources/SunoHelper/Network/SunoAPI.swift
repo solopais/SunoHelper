@@ -6,6 +6,7 @@ enum SunoError: LocalizedError {
     case http(Int, String)
     case network(Error)
     case cancelled
+    case uploadFailed(String)  // 上传各步骤失败（获取预签名URL / S3上传 / 注册）
 
     var errorDescription: String? {
         switch self {
@@ -19,8 +20,25 @@ enum SunoError: LocalizedError {
             return "网络错误：\(e.localizedDescription)"
         case .cancelled:
             return "已取消"
+        case .uploadFailed(let reason):
+            return "上传失败：\(reason)"
         }
     }
+}
+
+// MARK: - 音频上传相关数据结构
+
+/// Step 1 返回：S3 预签名上传信息
+struct AudioUploadRequestResponse: Decodable {
+    let id: String                 // 上传任务 ID，后续用于关联生成任务
+    let url: String                // S3 预签名 POST URL
+    let fields: [String: String]   // S3 表单字段（key, policy, signature 等）
+}
+
+/// Step 1+2 完成后的结果，供 generate 调用使用
+struct AudioUploadResult {
+    let uploadId: String           // Suno 上传任务 ID
+    let audioUrl: String           // 文件在 Suno CDN/S3 的最终 URL（由 id 拼接）
 }
 
 /// Suno 网页内部 API 客户端（cookie 认证，非官方但免费账户可用）
@@ -55,67 +73,115 @@ struct SunoAPI {
         }
     }
 
-    /// 音频上传 + 生成一体接口（multipart/form-data）— 接受预读取的 Data，避免沙盒权限过期
-    func generateWithAudioData(fileData: Data, fileName: String, payload: GeneratePayload) async throws -> [SunoClipStub] {
+    // MARK: - 音频上传（S3 两步流程）
+    //
+    // Suno 真实音频上传流程（从网页版逆向确认）：
+    //   Step 1: POST /api/uploads/audio { extension: "mp3" } → 获取 S3 预签名 URL + 表单字段
+    //   Step 2: POST 文件到 S3（使用预签名 URL + fields，multipart/form-data）
+    //   Step 3: 用返回的 uploadId / audioUrl 进行后续生成或翻唱
+    //
+    // 之前直接 multipart 到 /api/generate/v2/ 是完全错误的协议。
+
+    /// Step 1: 请求 S3 预签名上传 URL
+    func requestAudioUpload(fileExtension: String) async throws -> AudioUploadRequestResponse {
         try await run {
-            let apiURL = URL(string: "\(SunoAPI.base)/api/generate/v2/")!
-            let mimeType = mimeTypeForAudio(fileName)
-
-            // 构建 multipart/form-data body
-            let boundary = "Boundary-\(UUID().uuidString)"
-            var body = Data()
-
-            // 音频上传模式只发核心字段（避免 weirdness/style_weight/audio_weight/task/token 等多余字段
-            // 导致服务端 400/断连；网页版实测 AUDIO 模式仅接受以下字段）
-            let audioFields: [(String, String?)] = [
-                ("make_instrumental", "\(payload.make_instrumental)"),
-                ("mv", payload.mv),
-                ("generation_type", payload.generation_type),
-                ("prompt", payload.prompt.isEmpty ? nil : payload.prompt),
-                ("gpt_description_prompt", payload.gpt_description_prompt),
-                ("tags", payload.tags),
-                ("title", payload.title),
-                ("negative_tags", payload.negative_tags),
-                ("vocal_gender", payload.vocal_gender),
-            ]
-
-            for (key, value) in audioFields {
-                if let v = value, !v.isEmpty {
-                    body.append(Data("--\(boundary)\r\n".utf8))
-                    body.append(Data("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n".utf8))
-                    body.append(Data("\(v)\r\n".utf8))
-                }
-            }
-
-            // 文件字段（文件名做 percent-encoding，处理中文等非 ASCII 字符）
-            let safeName = encodedFileName(fileName)
-            body.append(Data("--\(boundary)\r\n".utf8))
-            body.append(Data("Content-Disposition: form-data; name=\"audio_file\"; filename=\"\(safeName)\"\r\n".utf8))
-            body.append(Data("Content-Type: \(mimeType)\r\n\r\n".utf8))
-            body.append(fileData)
-            body.append(Data("\r\n".utf8))
-
-            // 结束标记
-            body.append(Data("--\(boundary)--\r\n".utf8))
-
-            // 构建请求（显式 Content-Length 防止大文件上传时连接被意外断开）
-            var req = URLRequest(url: apiURL)
+            let url = URL(string: "\(SunoAPI.base)/api/uploads/audio")!
+            var req = URLRequest(url: url)
             req.httpMethod = "POST"
-            req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-            req.setValue("\(body.count)", forHTTPHeaderField: "Content-Length")
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.setValue("https://suno.com/", forHTTPHeaderField: "Referer")
             req.setValue("https://suno.com", forHTTPHeaderField: "Origin")
             for (k, v) in SunoSession.shared.authHeaders() {
                 req.setValue(v, forHTTPHeaderField: k)
             }
+            let body = try JSONEncoder().encode(["extension": fileExtension])
             req.httpBody = body
-            req.timeoutInterval = 300  // 大文件/弱网环境给足 5 分钟
+            req.timeoutInterval = 30
 
             let (data, resp) = try await URLSession.shared.data(for: req)
             try Self.check(resp: resp, data: data)
-            let decoded = try JSONDecoder().decode(GenerateResponse.self, from: data)
-            return decoded.clips
+            let decoded = try JSONDecoder().decode(AudioUploadRequestResponse.self, from: data)
+            return decoded
         }
+    }
+
+    /// Step 2: 上传文件到 S3（使用预签名 URL + form fields）
+    func uploadFileToS3(presignedURL: String, fields: [String: String],
+                        fileData: Data, fileName: String, mimeType: String) async throws {
+        try await run {
+            let s3URL = URL(string: presignedURL)!
+            let boundary = "Boundary-\(UUID().uuidString)"
+            var body = Data()
+
+            // 先添加所有 S3 表单字段
+            for (key, value) in fields {
+                body.append(Data("--\(boundary)\r\n".utf8))
+                body.append(Data("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n".utf8))
+                body.append(Data("\(value)\r\n".utf8))
+            }
+
+            // 再添加文件字段
+            let safeName = encodedFileName(fileName)
+            body.append(Data("--\(boundary)\r\n".utf8))
+            body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"\(safeName)\"\r\n".utf8))
+            body.append(Data("Content-Type: \(mimeType)\r\n\r\n".utf8))
+            body.append(fileData)
+            body.append(Data("\r\n--\(boundary)--\r\n".utf8))
+
+            var req = URLRequest(url: s3URL)
+            req.httpMethod = "POST"
+            req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+            req.setValue("\(body.count)", forHTTPHeaderField: "Content-Length")
+            req.httpBody = body
+            req.timeoutInterval = 300  // 大文件给 5 分钟
+
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            // S3 返回 204 No Content 或 200 OK 表示成功
+            if let http = resp as? HTTPURLResponse {
+                if !(200...299).contains(http.statusCode) {
+                    let msg = String(data: data, encoding: .utf8) ?? "S3 upload failed with status \(http.statusCode)"
+                    throw SunoError.uploadFailed(msg)
+                }
+            }
+        }
+    }
+
+    /// 音频上传完整流程（Step 1 + Step 2），返回上传结果供后续 generate/cover 使用
+    /// 这是新入口：替代旧的直接 multipart 到 generate 的错误方式
+    func uploadAudioOnly(fileData: Data, fileName: String) async throws -> AudioUploadResult {
+        // 推断文件扩展名
+        let ext = (fileName as NSString).pathExtension.lowercased()
+        let mimeType = mimeTypeForAudio(fileName)
+
+        // Step 1: 获取 S3 预签名 URL
+        let uploadReq = try await requestAudioUpload(fileExtension: ext.isEmpty ? "mp3" : ext)
+
+        // Step 2: 上传文件到 S3
+        try await uploadFileToS3(
+            presignedURL: uploadReq.url,
+            fields: uploadReq.fields,
+            fileData: fileData,
+            fileName: fileName,
+            mimeType: mimeType
+        )
+
+        // 构造结果：audioUrl 由 id 拼接（Suno CDN 格式）
+        let audioUrl = "https://cdn1.suno.ai/\(uploadReq.id).\(ext.isEmpty ? "mp3" : ext)"
+        return AudioUploadResult(uploadId: uploadReq.id, audioUrl: audioUrl)
+    }
+
+    /// 旧接口兼容（内部不再使用，保留避免编译报错）
+    /// 实际已改为走 uploadAudioOnly → generate(audioUrl:) 的两步流程
+    @available(*, deprecated, message: "Use uploadAudioOnly + generate(payload:withAudioUrl:) instead")
+    func generateWithAudioData(fileData: Data, fileName: String, payload: GeneratePayload) async throws -> [SunoClipStub] {
+        // 新流程：先上传，再用 audioUrl 生成
+        let uploadResult = try await uploadAudioOnly(fileData: fileData, fileName: fileName)
+
+        // 构造带 audioUrl 的 payload 并提交生成
+        var audioPayload = payload
+        audioPayload.generation_type = "AUDIO"
+        audioPayload.prompt = uploadResult.audioUrl  // audio 模式下 prompt 传音频 URL
+        return try await generate(payload: audioPayload)
     }
 
     /// 对文件名做 percent-encoding，确保中文名在 multipart Content-Disposition 中合法

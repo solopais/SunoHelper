@@ -298,12 +298,22 @@ struct GenerateView: View {
             do {
                 let stubs: [SunoClipStub]
 
-                // 如果选择了音频文件，走 multipart 上传路径（用预读取的 Data 避免沙盒权限过期）
+                // 如果选择了音频文件，走 S3 两步上传流程（先上传到 Suno S3，再用 URL 提交生成）
                 if let audioData = pickedAudioData, let audioURL = pickedAudioURL {
-                    message = "正在上传音频并提交创作任务…"
+                    // Step 1+2: 上传音频到 Suno S3（获取预签名 URL → POST 文件）
+                    message = "正在上传音频到 Suno（1/2）…"
+                    let uploadResult = try await SunoAPI.shared.uploadAudioOnly(
+                        fileData: audioData,
+                        fileName: audioURL.lastPathComponent
+                    )
+
+                    // Step 3: 用上传后的 URL 提交创作/翻唱任务
+                    message = "音频上传成功，提交创作任务（2/2）…"
                     var audioPayload = buildPayload()
                     audioPayload.generation_type = "AUDIO"
-                    stubs = try await SunoAPI.shared.generateWithAudioData(fileData: audioData, fileName: audioURL.lastPathComponent, payload: audioPayload)
+                    audioPayload.prompt = uploadResult.audioUrl  // AUDIO 模式：prompt 传音频 CDN URL
+                    audioPayload.audio_url = uploadResult.audioUrl  // 双保险：部分 API 版本用此字段
+                    stubs = try await SunoAPI.shared.generate(payload: audioPayload)
                 } else {
                     stubs = try await SunoAPI.shared.generate(payload: buildPayload())
                 }

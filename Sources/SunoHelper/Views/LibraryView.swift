@@ -82,8 +82,7 @@ struct LibraryView: View {
     }
 
     /// 完全重新加载（下拉刷新 / 首次进入 / 创作完成通知）
-    /// 策略：先连续加载前 3 页（~60 首），让用户立即看到足够多的歌曲；
-    /// 然后后台继续加载剩余页面，避免只显示第一页的 ~20 首导致"1569 首但列表不全"
+    /// 策略：先加载第 1 页立即展示，然后后台渐进式加载剩余页面
     func fullReload() async {
         guard session.isLoggedIn else {
             await MainActor.run { refreshMsg = "请先登录 Suno 账户" }
@@ -97,43 +96,43 @@ struct LibraryView: View {
             loadingMore = false
         }
 
-        // 连续加载前 3 页（或直到无更多数据），合并后一次性写入 store
-        var allSongs: [Song] = []
-        let initialPages = 3
-        var actualLoadedPages = 0
-
-        for page in 1...initialPages {
-            do {
-                let resp = try await SunoAPI.shared.library(page: page)
-                let songs = resp.clips.map { Song.from(clip: $0) }
-                if songs.isEmpty { break }           // 空页说明到底了
-                allSongs.append(contentsOf: songs)
-                actualLoadedPages += 1
-                await MainActor.run {
-                    totalCount = resp.num_total_results
-                    // 只要还有数据就继续（不依赖 has_more，该字段可能不准）
-                    hasMorePages = resp.has_more == true || (totalCount != nil && allSongs.count < totalCount!)
+        do {
+            // 先加载第 1 页，让用户立刻看到数据
+            let resp = try await SunoAPI.shared.library(page: 1)
+            let songs = resp.clips.map { Song.from(clip: $0) }
+            await MainActor.run {
+                if !songs.isEmpty {
+                    store.replaceRemote(songs)
                 }
-                if resp.has_more != true && (totalCount == nil || allSongs.count >= totalCount!) { break }
-            } catch {
-                // 单页失败不终止整体刷新，已加载的数据仍然有效
-                await MainActor.run { refreshMsg = "第 \(page) 页加载失败，已加载前 \(allSongs.count) 首" }
-                break
+                totalCount = resp.num_total_results
+                currentPage = 2
+                hasMorePages = resp.has_more == true
+                allLoaded = !hasMorePages
+                refreshing = false
             }
-        }
 
-        await MainActor.run {
-            if !allSongs.isEmpty {
-                store.replaceRemote(allSongs)
+            // 第 1 页成功后，后台继续预加载（不阻塞用户浏览）
+            if hasMorePages && !allLoaded {
+                Task { await preloadRemaining() }
             }
-            currentPage = actualLoadedPages + 1      // 下一页从已加载的下一页开始
-            allLoaded = !hasMorePages               // 根据实际判断是否全部加载完
-            refreshing = false
-        }
-
-        // 前台预加载：如果还有更多数据且未全部加载，继续在后台拉取剩余页面
-        if hasMorePages && !allLoaded {
-            Task { await preloadRemaining() }
+        } catch let error as SunoError {
+            // 区分认证过期 vs 网络错误，给用户明确提示
+            await MainActor.run {
+                refreshing = false
+                switch error {
+                case .authExpired:
+                    refreshMsg = "登录已过期，请重新登录 Suno 账户"
+                case .captcha:
+                    refreshMsg = "需要人机验证，请在浏览器中访问 suno.com 确认"
+                default:
+                    refreshMsg = "加载失败：\(error.localizedDescription)"
+                }
+            }
+        } catch {
+            await MainActor.run {
+                refreshing = false
+                refreshMsg = "加载失败：\(error.localizedDescription)"
+            }
         }
     }
 
@@ -143,6 +142,7 @@ struct LibraryView: View {
         guard !loadingMore, !allLoaded, hasMorePages else { return }
         await MainActor.run { loadingMore = true }
 
+        var consecutiveErrors = 0
         while hasMorePages && !allLoaded {
             do {
                 let resp = try await SunoAPI.shared.library(page: currentPage)
@@ -159,10 +159,24 @@ struct LibraryView: View {
                     }
                     allLoaded = !hasMorePages || !hadNew
                 }
+                consecutiveErrors = 0
                 // 每页之间稍作间隔，避免请求过于密集
                 try? await Task.sleep(nanoseconds: 300_000_000)  // 300ms
+            } catch let error as SunoError {
+                consecutiveErrors += 1
+                if case .authExpired = error {
+                    // 认证过期不再重试
+                    await MainActor.run { refreshMsg = "登录已过期，请重新登录" }
+                    await MainActor.run { loadingMore = false }
+                    return
+                }
+                if consecutiveErrors >= 3 {
+                    await MainActor.run { loadingMore = false }
+                    return
+                }
+                // 单次失败稍等重试
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
             } catch {
-                // 预加载失败静默重试下次滚动触发
                 await MainActor.run { loadingMore = false }
                 return
             }
@@ -192,9 +206,15 @@ struct LibraryView: View {
                 if !hasMorePages || !hadNew { allLoaded = true }
                 totalCount = resp.num_total_results
             }
+        } catch let error as SunoError {
+            if case .authExpired = error {
+                await MainActor.run { refreshMsg = "登录已过期，请重新登录" }
+            } else {
+                // 单页加载失败不终止分页，下次滚动到底部会重试
+                await MainActor.run { refreshMsg = "加载更多失败，稍后重试：\(error.localizedDescription)" }
+            }
         } catch {
-            // 单页加载失败不终止分页，下次滚动到底部会重试
-            await MainActor.run { refreshMsg = "加载更多失败，稍后重试：\(error.localizedDescription)" }
+            await MainActor.run { refreshMsg = "加载更多失败：\(error.localizedDescription)" }
         }
 
         await MainActor.run { loadingMore = false }

@@ -205,6 +205,9 @@ struct GeneratePayload: Encodable {
     var cover_clip_id: String? = nil            // 翻唱(Cover) 基于的源歌曲 id（API 真实字段名）
     var task: String? = nil                     // "extend" / "whole" / "cover" 等
 
+    // === 音频上传参数 ===
+    var audio_url: String? = nil                // 音频上传后的 CDN URL（S3 两步上传流程用）
+
     // === 验证相关 ===
     var token: String? = nil                   // hCaptcha token（由 WebView 注入）
 
