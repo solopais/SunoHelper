@@ -6,6 +6,8 @@ struct LibraryView: View {
     @StateObject private var session = SunoSession.shared
     @State private var showExtend = false
     @State private var extendClipID: String?
+    @State private var showCover = false
+    @State private var coverClipID: String?
     @State private var refreshing = false
     @State private var refreshMsg = ""
     @State private var didInitialLoad = false
@@ -33,6 +35,7 @@ struct LibraryView: View {
                         loadingMore: $loadingMore,
                         allLoaded: $allLoaded,
                         onExtend: { id in extendClipID = id; showExtend = true },
+                        onCover: { id in coverClipID = id; showCover = true },
                         onDelete: { song in
                             if let path = song.downloadedLocalPath {
                                 try? FileManager.default.removeItem(at: URL(fileURLWithPath: path))
@@ -70,6 +73,11 @@ struct LibraryView: View {
                 GenerateView(extendClipID: id)
             }
         }
+        .sheet(isPresented: $showCover) {
+            if let id = coverClipID {
+                GenerateView(coverClipID: id)
+            }
+        }
     }
 
     /// 完全重新加载（下拉刷新 / 首次进入）
@@ -91,6 +99,7 @@ struct LibraryView: View {
             let songs = resp.clips.map { Song.from(clip: $0) }
             await MainActor.run {
                 store.mergeRemote(songs)
+                currentPage = 2       // page=1 已加载，下一页从 2 开始
                 hasMorePages = resp.has_more == true
                 allLoaded = !hasMorePages
                 totalCount = resp.num_total_results
@@ -168,6 +177,7 @@ private struct SongListContent: View {
     @Binding var loadingMore: Bool
     @Binding var allLoaded: Bool
     let onExtend: (String) -> Void
+    let onCover: (String) -> Void
     let onDelete: (Song) -> Void
 
     var body: some View {
@@ -175,6 +185,8 @@ private struct SongListContent: View {
             ForEach(songs) { song in
                 SongCard(song: song) {
                     onExtend(song.id)
+                } onCover: {
+                    onCover(song.id)
                 }
                 .listRowSeparator(.hidden)
                 .listRowBackground(Color.clear)

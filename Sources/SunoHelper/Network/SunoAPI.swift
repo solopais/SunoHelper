@@ -55,6 +55,91 @@ struct SunoAPI {
         }
     }
 
+    /// 音频上传 + 生成一体接口（multipart/form-data）
+    /// Suno 的 AUDIO_UPLOAD 模式需要将音频文件以 multipart 形式提交到生成端点
+    func generateWithAudio(fileURL: URL, payload: GeneratePayload) async throws -> [SunoClipStub] {
+        try await run {
+            let url = URL(string: "\(SunoAPI.base)/api/generate/v2/")!
+
+            // 读取音频文件数据
+            let fileData = try Data(contentsOf: url)
+            let fileName = fileURL.lastPathComponent
+            let mimeType = mimeTypeForAudio(fileName)
+
+            // 构建 multipart/form-data body
+            let boundary = "Boundary-\(UUID().uuidString)"
+            var body = Data()
+
+            // 普通文本字段（从 payload 提取）
+            let formFields: [(String, String?)] = [
+                ("make_instrumental", "\(payload.make_instrumental)"),
+                ("mv", payload.mv),
+                ("generation_type", "AUDIO_UPLOAD"),
+                ("prompt", payload.prompt.isEmpty ? nil : payload.prompt),
+                ("gpt_description_prompt", payload.gpt_description_prompt),
+                ("tags", payload.tags),
+                ("title", payload.title),
+                ("negative_tags", payload.negative_tags),
+                ("vocal_gender", payload.vocal_gender),
+                ("weirdness_constraint", payload.weirdness_constraint.map { "\($0)" }),
+                ("style_weight", payload.style_weight.map { "\($0)" }),
+                ("audio_weight", payload.audio_weight.map { "\($0)" }),
+                ("task", payload.task),
+                ("token", payload.token),
+            ]
+
+            for (key, value) in formFields {
+                if let v = value, !v.isEmpty {
+                    body.append("--\(boundary)\r\n")
+                    body.append("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n")
+                    body.append("\(v)\r\n")
+                }
+            }
+
+            // 文件字段
+            body.append("--\(boundary)\r\n")
+            body.append("Content-Disposition: form-data; name=\"audio_file\"; filename=\"\(fileName)\"\r\n")
+            body.append("Content-Type: \(mimeType)\r\n\r\n")
+            body.append(fileData)
+            body.append("\r\n")
+
+            // 结束标记
+            body.append("--\(boundary)--\r\n")
+
+            // 构建请求
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+            req.setValue("https://suno.com/", forHTTPHeaderField: "Referer")
+            req.setValue("https://suno.com", forHTTPHeaderField: "Origin")
+            for (k, v) in SunoSession.shared.authHeaders() {
+                req.setValue(v, forHTTPHeaderField: k)
+            }
+            req.httpBody = body
+            req.timeoutInterval = 120  // 上传可能需要更长时间
+
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            try Self.check(resp: resp, data: data)
+            let decoded = try JSONDecoder().decode(GenerateResponse.self, from: data)
+            return decoded.clips
+        }
+    }
+
+    /// 根据文件扩展名推断 MIME 类型
+    private func mimeTypeForAudio(_ fileName: String) -> String {
+        let ext = fileName.pathExtension.lowercased()
+        switch ext {
+        case "mp3": return "audio/mpeg"
+        case "wav": return "audio/wav"
+        case "m4a": return "audio/mp4"
+        case "ogg": return "audio/ogg"
+        case "flac": return "audio/flac"
+        case "aac": return "audio/aac"
+        default: return "audio/mpeg"
+        }
+    }
+
+    /// 普通 JSON 生成（文本模式 / 续写 / Cover）
     func generate(payload: GeneratePayload) async throws -> [SunoClipStub] {
         try await run {
             let url = URL(string: "\(SunoAPI.base)/api/generate/v2/")!

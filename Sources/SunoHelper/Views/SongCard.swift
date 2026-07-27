@@ -3,6 +3,7 @@ import SwiftUI
 struct SongCard: View {
     let song: Song
     var onExtend: () -> Void = {}
+    var onCover: () -> Void = {}
 
     @StateObject private var player = AudioPlayer.shared
     @StateObject private var dl = DownloadManager.shared
@@ -92,6 +93,11 @@ struct SongCard: View {
 
                 compactAction(icon: "arrow.forward.to.line", label: "续写") {
                     onExtend()
+                }
+                .disabled(song.audioURL == nil)
+
+                compactAction(icon: "waveform.badge.mic", label: "Cover") {
+                    onCover()
                 }
                 .disabled(song.audioURL == nil)
 

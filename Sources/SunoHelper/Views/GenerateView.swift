@@ -37,14 +37,16 @@ struct GenerateView: View {
 
     // === 续写模式 ===
     private let extendClipID: String?
+    private let coverClipID: String?       // Cover 模式：基于已有歌曲翻唱
     @State private var extendNote = ""
 
     // === 账户信息 ===
     @State private var planType: SunoPlanType = .unknown
     @State private var creditsLeft: Int?
 
-    init(extendClipID: String? = nil) {
+    init(extendClipID: String? = nil, coverClipID: String? = nil) {
         self.extendClipID = extendClipID
+        self.coverClipID = coverClipID
     }
 
     // 根据账户类型过滤可用模型
@@ -63,6 +65,11 @@ struct GenerateView: View {
                     // MARK: - 续写模式提示
                     if let ext = extendClipID {
                        续写Header(clipId: ext)
+                    }
+
+                    // MARK: - Cover 模式提示
+                    if let cid = coverClipID {
+                        CoverHeader(clipId: cid)
                     }
 
                     // MARK: - 顶栏：模式切换 + 模型选择
@@ -209,6 +216,7 @@ struct GenerateView: View {
     }
 
     var navTitle: String {
+        if coverClipID != nil { return "Cover 翻唱" }
         if extendClipID != nil { return "续写歌曲" }
         return "创作"
     }
@@ -217,6 +225,7 @@ struct GenerateView: View {
     func canSubmit() -> Bool {
         if busy { return false }
         if extendClipID != nil { return true }  // 续写不需要必填
+        if coverClipID != nil { return true }   // Cover 不需要必填
         return !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
@@ -239,6 +248,29 @@ struct GenerateView: View {
         }
     }
 
+    /// 构建生成载荷（根据当前表单状态）
+    func buildPayload() -> GeneratePayload {
+        if let cid = coverClipID {
+            return .cover(clipId: cid, model: model)
+        } else if let ext = extendClipID {
+            return .extend(clipId: ext, at: 0, model: model, note: extendNote)
+        } else if createMode == .simple {
+            var p = GeneratePayload.simple(prompt: prompt, model: model, instrumental: instrumental)
+            applyAdvancedParams(&p)
+            return p
+        } else {
+            var gen = vocalGender?.rawValue
+            var ww = weirdness / 100.0
+            var sw = styleWeight / 100.0
+            return .custom(
+                lyrics: prompt, tags: tags, title: title,
+                model: model, instrumental: instrumental,
+                negativeTags: negativeTags.isEmpty ? nil : negativeTags,
+                gender: gen, weirdness: ww, styleWeight: sw
+            )
+        }
+    }
+
     /// 执行生成
     func runGenerate() {
         guard session.isLoggedIn else {
@@ -246,34 +278,22 @@ struct GenerateView: View {
             return
         }
         busy = true
-        message = "提交创作任务…"
+        message = pickedAudioURL != nil ? "正在上传音频并提交创作任务…" : "提交创作任务…"
         captchaBlocked = false
-
-        let payload: GeneratePayload
-        if let ext = extendClipID {
-            payload = .extend(clipId: ext, at: 0, model: model, note: extendNote)
-        } else if createMode == .simple {
-            // 简单模式 → gpt_description_prompt
-            var p = GeneratePayload.simple(prompt: prompt, model: model, instrumental: instrumental)
-            // 也把高级参数带上去（如果用户在简单模式下也设了）
-            applyAdvancedParams(&p)
-            payload = p
-        } else {
-            // 高级模式 → 完整自定义
-            var gen = vocalGender?.rawValue
-            var ww = weirdness / 100.0  // 0-100% → 0.0-1.0
-            var sw = styleWeight / 100.0
-            payload = .custom(
-                lyrics: prompt, tags: tags, title: title,
-                model: model, instrumental: instrumental,
-                negativeTags: negativeTags.isEmpty ? nil : negativeTags,
-                gender: gen, weirdness: ww, styleWeight: sw
-            )
-        }
 
         Task {
             do {
-                let stubs = try await SunoAPI.shared.generate(payload: payload)
+                let stubs: [SunoClipStub]
+
+                // 如果选择了音频文件，走 multipart 上传路径
+                if let audioURL = pickedAudioURL {
+                    message = "正在上传音频并提交创作任务…"
+                    var audioPayload = buildPayload()
+                    audioPayload.generation_type = "AUDIO_UPLOAD"
+                    stubs = try await SunoAPI.shared.generateWithAudio(fileURL: audioURL, payload: audioPayload)
+                } else {
+                    stubs = try await SunoAPI.shared.generate(payload: buildPayload())
+                }
                 let ids = stubs.map { $0.id }
                 await MainActor.run { message = "已提交，Suno 创作中（\(ids.count) 首）…" }
 
@@ -393,7 +413,10 @@ private struct AdvancedModeSection: View {
                     Image(systemName: "doc.fill").font(.caption).foregroundColor(AppTheme.accent)
                     Text(name)
                         .font(.caption).foregroundColor(AppTheme.textSecondary).lineLimit(1)
-                    Button(action: { /* TODO: 清除选择 */ }) {
+                    Button(action: {
+                        pickedAudioURL = nil
+                        pickedAudioName = nil
+                    }) {
                         Image(systemName: "xmark.circle.fill").font(.caption).foregroundColor(AppTheme.textSecondary)
                     }
                 }
@@ -550,6 +573,20 @@ private struct 续写Header: View {
             Label("续写模式", systemImage: "arrow.forward.to.line")
                 .font(.headline).foregroundColor(AppTheme.accent)
             Text("基于已选片段继续生成（id: \(clipId.prefix(8))…）")
+                .font(.caption).foregroundColor(AppTheme.textSecondary)
+        }
+        .padding(.horizontal, 16)
+    }
+}
+
+// MARK: - Cover 头部
+private struct CoverHeader: View {
+    let clipId: String
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("Cover 翻唱模式", systemImage: "waveform.badge.mic")
+                .font(.headline).foregroundColor(AppTheme.accent)
+            Text("基于已选歌曲重新生成（保留原曲结构，可换风格/模型）\nid: \(clipId.prefix(8))…")
                 .font(.caption).foregroundColor(AppTheme.textSecondary)
         }
         .padding(.horizontal, 16)

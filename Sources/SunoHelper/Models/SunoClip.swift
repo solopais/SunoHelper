@@ -245,4 +245,13 @@ struct GeneratePayload: Encodable {
         p.task = "extend"
         return p
     }
+
+    /// Cover 翻唱：基于已有歌曲重新生成（保留旋律/结构，换风格/人声）
+    static func cover(clipId: String, model: String) -> GeneratePayload {
+        var p = GeneratePayload(make_instrumental: false, mv: model)
+        p.continue_clip_id = clipId
+        p.task = "cover"
+        p.generation_type = "COVER"
+        return p
+    }
 }
