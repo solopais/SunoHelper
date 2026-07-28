@@ -805,6 +805,12 @@ struct UploadedAudioInfo {
     let note: String?      // 非阻塞提示（如超时兜底/404 兜底）
 }
 
+/// 上传轮询结果：成功(可兜底超时) / 需整段重传
+enum UploadOutcome {
+    case success(timedOut: Bool, poll404: Bool)
+    case retry
+}
+
 extension GenerateView {
     /// 选中音频文件后自动上传到 Suno（S3 两步 + 轮询处理），
     /// 上传成功后弹出翻唱页，用该音频作为风格参考生成新歌。
@@ -812,82 +818,120 @@ extension GenerateView {
         uploadingAudio = true
         uploadMsg = "正在上传音频（1/3）…"
         Task {
-            do {
-                let ext = (fileName as NSString).pathExtension.lowercased()
-                let uploadReq = try await SunoAPI.shared.requestAudioUpload(
-                    fileExtension: ext.isEmpty ? "mp3" : ext
-                )
-                await MainActor.run { uploadMsg = "上传到云端（2/3）… \(data.count / 1024)KB" }
-                let mime = SunoAPI.shared.mimeTypeForAudioPublic(fileName)
-                try await SunoAPI.shared.uploadFileToS3(
-                    presignedURL: uploadReq.url,
-                    fields: uploadReq.fields,
-                    fileData: data,
-                    fileName: fileName,
-                    mimeType: mime
-                )
-                // Step 2.5: 通知 Suno 服务器文件已上传完成（触发处理）
-                // ⚠️ 缺此步骤 → 服务器不知道 S3 上传完毕 → 轮询永远 processing
-                await MainActor.run { uploadMsg = "通知 Suno 开始处理（2.5/3）…" }
-                try await SunoAPI.shared.confirmUploadFinish(uploadId: uploadReq.id, fileName: fileName)
-                // Step 3: 轮询 Suno 后端处理音频。调了 upload-finish 后通常 1-2 分钟即 complete，
-                // 保留 200 轮窗口兜底极端慢的情况。
-                await MainActor.run { uploadMsg = "Suno 正在处理音频（3/3），请稍候…" }
-                var rounds = 0
-                let maxRounds = 200            // 200 × 3s ≈ 10 分钟
-                var status: AudioUploadStatus?
-                var pollErrored404 = false     // Suno 处理完会删除上传资源 → 轮询 404，视为完成
-                while rounds < maxRounds {
-                    try await Task.sleep(nanoseconds: 3_000_000_000)
-                    rounds += 1
-                    do {
-                        status = try await SunoAPI.shared.pollUploadStatus(uploadId: uploadReq.id)
-                        pollErrored404 = false
-                    } catch let SunoError.http(code, _) where code == 404 {
-                        // Suno 处理完音频后会删除该上传资源，轮询接口返回 404。
-                        // 这通常代表音频已就绪（而非失败），直接以 id 拼 CDN 地址兜底视为完成。
-                        DebugLog.shared.info("上传", "轮询 404（视为处理完成）: \(uploadReq.id)")
-                        pollErrored404 = true
-                        status = AudioUploadStatus(id: uploadReq.id, status: "complete", title: nil, audio_url: nil, copyright_muted: nil)
-                        break
-                    } catch {
-                        // 其他瞬时错误（如 -1005 抖动）视为仍在处理，继续等待
-                        DebugLog.shared.info("上传", "轮询异常(继续等待): \(error.localizedDescription)")
-                    }
-                    await MainActor.run { uploadMsg = "Suno 处理音频中（\(rounds)/\(maxRounds)）…" }
-                    if status?.status != "processing" { break }
-                }
-                let finalStatus = status?.status ?? "processing"
-                guard finalStatus != "error" else {
-                    throw SunoError.uploadFailed("音频处理失败：status=error")
-                }
-                // 超时/404 兜底：不丢弃上传，用 id 拼出 CDN 地址继续翻唱
-                // （Suno 通常仍在后台处理该资源，generate 引用 id 即可）
-                let cdn = status?.audio_url
-                    ?? "https://cdn1.suno.ai/\(uploadReq.id).\(ext.isEmpty ? "mp3" : ext)"
-                let timedOut = (finalStatus == "processing")
-                await MainActor.run {
-                    uploadedAudio = UploadedAudioInfo(
-                        id: uploadReq.id, url: cdn,
-                        name: fileName,
-                        localData: pickedAudioData,  // 保留原始数据用于试听（CDN URL 可能不可用）
-                        note: timedOut ? "⏳ 音频仍在处理中，已用上传地址兜底，可直接翻唱（若失败稍后重试）"
-                                : (pollErrored404 ? "✅ Suno 已处理完音频（轮询返回 404 视为完成），可直接翻唱" : nil)
+        do {
+            let ext = (fileName as NSString).pathExtension.lowercased()
+            let maxAttempts = 3            // 整段重传次数（处理偶发 status=error / 瞬时失败）
+            var lastErr: Error?
+            var result: UploadedAudioInfo?
+            uploadLoop: for attempt in 1...maxAttempts {
+                do {
+                    let uploadReq = try await SunoAPI.shared.requestAudioUpload(
+                        fileExtension: ext.isEmpty ? "mp3" : ext
                     )
-                    uploadingAudio = false
-                    showUploadedAudio = true
-                    pickedAudioData = nil
-                    pickedAudioURL = nil
-                    pickedAudioName = nil
-                }
-            } catch {
-                await MainActor.run {
-                    uploadingAudio = false
-                    uploadMsg = "❌ 上传失败：\(error.localizedDescription)"
-                    message = "❌ 上传失败：\(error.localizedDescription)"
-                    DebugLog.shared.error("上传", "自动上传失败: \(error.localizedDescription)")
+                    await MainActor.run { uploadMsg = "上传到云端（2/3）… \(data.count / 1024)KB" }
+                    let mime = SunoAPI.shared.mimeTypeForAudioPublic(fileName)
+                    try await SunoAPI.shared.uploadFileToS3(
+                        presignedURL: uploadReq.url,
+                        fields: uploadReq.fields,
+                        fileData: data,
+                        fileName: fileName,
+                        mimeType: mime
+                    )
+                    // Step 2.5: 通知 Suno 开始处理（新版已避免 -1005 重复触发导致 status=error）
+                    await MainActor.run { uploadMsg = "通知 Suno 开始处理（2.5/3）…" }
+                    try await SunoAPI.shared.confirmUploadFinish(uploadId: uploadReq.id, fileName: fileName)
+                    await MainActor.run { uploadMsg = "Suno 正在处理音频（3/3），请稍候…" }
+
+                    // Step 3: 轮询处理状态（调了 upload-finish 后通常 1-2 分钟即完成，
+                    // 保留 200 轮窗口兜底极端慢的情况）
+                    var rounds = 0
+                    let maxRounds = 200            // 200 × 3s ≈ 10 分钟
+                    var status: AudioUploadStatus?
+                    var pollErrored404 = false
+                    var outcome: UploadOutcome?
+                    while rounds < maxRounds {
+                        try await Task.sleep(nanoseconds: 3_000_000_000)
+                        rounds += 1
+                        do {
+                            status = try await SunoAPI.shared.pollUploadStatus(uploadId: uploadReq.id)
+                            pollErrored404 = false
+                        } catch let SunoError.http(code, _) where code == 404 {
+                            // Suno 处理完会删除上传资源 → 404 视为完成
+                            DebugLog.shared.info("上传", "轮询 404（视为处理完成）: \(uploadReq.id)")
+                            pollErrored404 = true
+                            status = AudioUploadStatus(id: uploadReq.id, status: "complete", title: nil, audio_url: nil, copyright_muted: nil)
+                            outcome = .success(timedOut: false, poll404: true)
+                            break
+                        } catch {
+                            DebugLog.shared.info("上传", "轮询异常(继续等待): \(error.localizedDescription)")
+                        }
+                        await MainActor.run { uploadMsg = "Suno 处理音频中（\(rounds)/\(maxRounds)）…" }
+                        let s = status?.status ?? "processing"
+                        switch s {
+                        case "processing", "uploaded", "pending", "queued":
+                            continue                          // 仍在处理 / 排队，继续等
+                        case "complete", "passed_audio_processing":
+                            outcome = .success(timedOut: false, poll404: false)
+                            break
+                        case "error", "failed":
+                            // 处理失败 → 标记整段重传（用全新 id 避开本次失败的处理任务）
+                            lastErr = SunoError.uploadFailed("音频处理失败：status=\(s)")
+                            outcome = .retry
+                            break
+                        default:
+                            // 未知状态兜底视为完成（避免误判失败）
+                            DebugLog.shared.info("上传", "未知状态[\(s)]，兜底视为完成")
+                            outcome = .success(timedOut: false, poll404: false)
+                            break
+                        }
+                        if outcome != nil { break }
+                    }
+                    if outcome == nil {
+                        // 轮询窗口耗尽仍 processing → 超时兜底（Suno 多半后台继续处理，generate 仍可引用 id）
+                        outcome = .success(timedOut: true, poll404: false)
+                    }
+
+                    switch outcome! {
+                    case .success(let timedOut, let poll404):
+                        let cdn = status?.audio_url
+                            ?? "https://cdn1.suno.ai/\(uploadReq.id).\(ext.isEmpty ? "mp3" : ext)"
+                        result = UploadedAudioInfo(
+                            id: uploadReq.id, url: cdn,
+                            name: fileName,
+                            localData: data,   // 原始音频数据（重试过程中 data 不变），试听确定有声音
+                            note: timedOut ? "⏳ 音频仍在处理中，已用上传地址兜底，可直接翻唱（若失败稍后重试）"
+                                    : (poll404 ? "✅ Suno 已处理完音频（轮询返回 404 视为完成），可直接翻唱" : nil)
+                        )
+                        break uploadLoop
+                    case .retry:
+                        await MainActor.run { uploadMsg = "音频处理失败，正在重新上传（\(attempt)/\(maxAttempts)）…" }
+                        continue uploadLoop
+                    }
+                } catch {
+                    lastErr = error
+                    await MainActor.run { uploadMsg = "上传出错，正在重试（\(attempt)/\(maxAttempts)）…" }
+                    continue uploadLoop
                 }
             }
+            guard let result = result else {
+                throw lastErr ?? SunoError.uploadFailed("上传失败")
+            }
+            await MainActor.run {
+                uploadedAudio = result
+                uploadingAudio = false
+                showUploadedAudio = true
+                pickedAudioData = nil
+                pickedAudioURL = nil
+                pickedAudioName = nil
+            }
+        } catch {
+            await MainActor.run {
+                uploadingAudio = false
+                uploadMsg = "❌ 上传失败：\(error.localizedDescription)"
+                message = "❌ 上传失败：\(error.localizedDescription)"
+                DebugLog.shared.error("上传", "自动上传失败: \(error.localizedDescription)")
+            }
+        }
         }
     }
 }

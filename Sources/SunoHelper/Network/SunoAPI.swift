@@ -92,8 +92,7 @@ struct SunoAPI {
     /// 吞掉偶发 -1005 / 断网抖动，避免一次网络闪断就整条上传/生成失败。
     /// 仅重试连接级错误（连接丢失/无法连接，服务端不可能已处理请求），
     /// 不重试超时(-1001)/取消(-999)/4xx/5xx（避免 POST 重复提交产生重复歌曲）。
-    private static func performDataRequest(_ req: URLRequest) async throws -> (Data, URLResponse) {
-        let maxAttempts = 3
+    private static func performDataRequest(_ req: URLRequest, maxAttempts: Int = 3) async throws -> (Data, URLResponse) {
         let retryable: [URLError.Code] = [
             .networkConnectionLost,   // -1005
             .cannotConnectToHost,     // -1004
@@ -187,24 +186,53 @@ struct SunoAPI {
     /// Step 2.5: 报告上传完毕（通知 Suno 服务器 S3 文件已上传完成，开始处理音频）
     /// ⚠️ 缺少此步骤会导致轮询永远 processing（服务器不知道文件已就绪）
     /// 对应网页端流程第 3 步：POST /api/uploads/audio/{id}/upload-finish
+    ///
+    /// ⚠️ 关键修复：upload-finish 是非幂等的「开始处理」指令，绝不能被网络层盲目重试。
+    /// 旧逻辑走通用 -1005 重试（最多 3 次），而 -1005 是「连接中途断开」——服务端很可能
+    /// 已经收到并处理了第一次请求，重试的第二次会触发重复处理 → Suno 音频处理直接 status=error。
+    /// 新逻辑：只发一次（maxAttempts=1）；若失败（含 -1005），先轮询该上传 id 是否已存在：
+    ///   - 已存在（任意状态）→ 说明 upload-finish 已生效，直接视为成功，绝不再重发；
+    ///   - 404（不存在）→ 仅补发一次。
+    /// 这样无论 -1005 是否已被服务端处理，最多只会产生一次有效的 upload-finish。
     func confirmUploadFinish(uploadId: String, fileName: String) async throws {
-        try await run {
-            let url = URL(string: "\(SunoAPI.base)/api/uploads/audio/\(uploadId)/upload-finish")!
-            var req = makeRequest(url, method: "POST")
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            let body = try JSONEncoder().encode([
-                "upload_type": "file_upload",
-                "upload_filename": fileName
-            ])
-            req.httpBody = body
-            DebugLog.shared.info("上传", "Step2.5 POST /upload-finish id=\(uploadId.prefix(8)) file=\(fileName)")
-            let (data, resp) = try await Self.performDataRequest(req)
-            if let http = resp as? HTTPURLResponse {
-                DebugLog.shared.info("上传", "upload-finish 响应: \(http.statusCode)")
-            }
-            try Self.check(resp: resp, data: data)
+        do {
+            try await performUploadFinishOnce(uploadId: uploadId, fileName: fileName)
             DebugLog.shared.success("上传", "upload-finish 成功（Suno 开始处理音频）")
+        } catch {
+            // 连接级错误（-1005 等）时请求可能已被 Suno 处理。安全校验：轮询该上传是否已注册。
+            DebugLog.shared.info("上传", "upload-finish 异常(\(error.localizedDescription))，校验上传是否已注册…")
+            do {
+                _ = try await pollUploadStatus(uploadId: uploadId)
+                DebugLog.shared.info("上传", "upload-finish 校验：id 已存在，视为已完成（不重复发送）")
+                return
+            } catch let SunoError.http(code, _) where code == 404 {
+                // 确实未注册 → 仅补发一次（同样不重试，避免再触发重复处理）
+                DebugLog.shared.info("上传", "upload-finish 校验：id 不存在(404)，补发一次")
+                try await performUploadFinishOnce(uploadId: uploadId, fileName: fileName)
+                DebugLog.shared.success("上传", "upload-finish 补发成功")
+            } catch {
+                // 校验也失败 → 抛出原始错误
+                throw error
+            }
         }
+    }
+
+    /// 单次发送 upload-finish（不重试）。失败由 confirmUploadFinish 统一做安全校验。
+    private func performUploadFinishOnce(uploadId: String, fileName: String) async throws {
+        let url = URL(string: "\(SunoAPI.base)/api/uploads/audio/\(uploadId)/upload-finish")!
+        var req = makeRequest(url, method: "POST")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body = try JSONEncoder().encode([
+            "upload_type": "file_upload",
+            "upload_filename": fileName
+        ])
+        req.httpBody = body
+        DebugLog.shared.info("上传", "Step2.5 POST /upload-finish id=\(uploadId.prefix(8)) file=\(fileName)")
+        let (data, resp) = try await Self.performDataRequest(req, maxAttempts: 1)
+        if let http = resp as? HTTPURLResponse {
+            DebugLog.shared.info("上传", "upload-finish 响应: \(http.statusCode)")
+        }
+        try Self.check(resp: resp, data: data)
     }
 
         /// 音频上传完整流程（Step 1 + Step 2），返回上传结果供后续 generate/cover 使用
