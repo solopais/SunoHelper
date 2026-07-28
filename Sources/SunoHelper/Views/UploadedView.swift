@@ -68,12 +68,9 @@ struct UploadedView: View {
             }
 
             Button(action: {
-                if let data = store.localData(for: item) {
-                    AudioPlayer.shared.playFromData(data, fileName: item.name)
-                    playMsg[item.id] = "▶ 正在播放（本地原文件）"
-                } else {
-                    playMsg[item.id] = "⚠ 本地文件已丢失，请重新上传"
-                }
+                // 播放 Suno 已处理后的版本（CDN）—— 用户要确认的是「Suno 那边收到的是什么」
+                AudioPlayer.shared.toggle(url: item.url)
+                playMsg[item.id] = "▶ 正在播放（Suno 处理版）"
             }) {
                 Label("播放", systemImage: "play.circle")
                     .font(.subheadline)

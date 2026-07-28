@@ -954,15 +954,9 @@ struct UploadedAudioView: View {
                     }
 
                     Button(action: {
-                        // 优先用本地原始音频数据（立即可用、确定有声音）。
-                        // CDN URL (info.url) 是拼接的兜底地址，很可能不存在 → AVPlayer 静默无声音。
-                        if let data = info.localData {
-                            AudioPlayer.shared.playFromData(data, fileName: info.name)
-                            playMsg = "▶ 正在播放本地原始音频"
-                        } else {
-                            AudioPlayer.shared.toggle(url: info.url)
-                            playMsg = "▶ 正在播放（CDN 加载中…）"
-                        }
+                        // 播放 Suno 已处理后的版本（CDN）—— 用户要听的是上传到 Suno 后的音频
+                        AudioPlayer.shared.toggle(url: info.url)
+                        playMsg = "▶ 正在播放（Suno 处理版）"
                     }) {
                         Label("试听上传的音频", systemImage: "play.circle")
                             .font(.subheadline)
