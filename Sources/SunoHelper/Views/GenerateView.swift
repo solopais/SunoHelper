@@ -841,13 +841,13 @@ extension GenerateView {
                     } catch let SunoError.http(code, _) where code == 404 {
                         // Suno 处理完音频后会删除该上传资源，轮询接口返回 404。
                         // 这通常代表音频已就绪（而非失败），直接以 id 拼 CDN 地址兜底视为完成。
-                        DebugLog.shared.warning("上传", "轮询 404（视为处理完成）: \(uploadReq.id)")
+                        DebugLog.shared.info("上传", "轮询 404（视为处理完成）: \(uploadReq.id)")
                         pollErrored404 = true
                         status = AudioUploadStatus(id: uploadReq.id, status: "complete", title: nil, audio_url: nil, copyright_muted: nil)
                         break
                     } catch {
                         // 其他瞬时错误（如 -1005 抖动）视为仍在处理，继续等待
-                        DebugLog.shared.warning("上传", "轮询异常(继续等待): \(error.localizedDescription)")
+                        DebugLog.shared.info("上传", "轮询异常(继续等待): \(error.localizedDescription)")
                     }
                     await MainActor.run { uploadMsg = "Suno 处理音频中（\(rounds)/\(maxRounds)）…" }
                     if status?.status != "processing" { break }
