@@ -51,7 +51,8 @@ struct AudioUploadStatus: Decodable {
     let status: String?          // "processing" → "complete" / "error"
     let title: String?
     let audio_url: String?       // 处理完成后可能返回真实 CDN URL（部分接口直接给）
-    let s3_id: String? = nil     // 处理完成后 Suno 分配的 clip/s3 id（initialize-clip 的上游）
+    let s3_id: String? = nil    // 处理完成后 Suno 分配的 clip/s3 id（initialize-clip 的上游）
+    let image_url: String?      // 处理完成后封面图（set_metadata 时用）
     let copyright_muted: Bool?
 }
 
@@ -205,12 +206,20 @@ struct SunoAPI {
             try await performUploadFinishOnce(uploadId: uploadId, fileName: fileName)
             DebugLog.shared.success("上传", "upload-finish 成功（Suno 开始处理音频）")
         } catch {
-            // 连接级错误（-1005 等）时请求可能已被 Suno 处理。安全校验：轮询该上传是否已注册。
-            DebugLog.shared.info("上传", "upload-finish 异常(\(error.localizedDescription))，校验上传是否已注册…")
+            // 连接级错误（-1005 等）时请求可能已被 Suno 处理。安全校验：轮询该上传状态。
+            DebugLog.shared.info("上传", "upload-finish 异常(\(error.localizedDescription))，校验上传状态…")
             do {
-                _ = try await pollUploadStatus(uploadId: uploadId)
-                DebugLog.shared.info("上传", "upload-finish 校验：id 已存在，视为已完成（不重复发送）")
-                return
+                let st = try await pollUploadStatus(uploadId: uploadId)
+                let begun = (st.status ?? "uploaded").lowercased()
+                if begun == "processing" || begun == "complete" || begun == "passed_audio_processing" {
+                    // 已开始处理（或完成）→ 说明 finish 已生效，视为成功，绝不重复发送
+                    DebugLog.shared.info("上传", "upload-finish 校验：音频已开始处理(status=\(st.status ?? "?"))，视为已完成")
+                    return
+                }
+                // status 仍为 uploaded/pending/created（未开始处理）→ finish 实际未送达，补发一次
+                DebugLog.shared.info("上传", "upload-finish 校验：id 存在但 status=\(st.status ?? "?")（未开始处理），补发一次")
+                try await performUploadFinishOnce(uploadId: uploadId, fileName: fileName)
+                DebugLog.shared.success("上传", "upload-finish 补发成功")
             } catch let SunoError.http(code, _) where code == 404 {
                 // 确实未注册 → 仅补发一次（同样不重试，避免再触发重复处理）
                 DebugLog.shared.info("上传", "upload-finish 校验：id 不存在(404)，补发一次")
@@ -260,8 +269,9 @@ struct SunoAPI {
             mimeType: mimeType
         )
 
-        // 构造结果：audioUrl 由 id 拼接（Suno CDN 格式）
-        let audioUrl = "https://cdn1.suno.ai/\(uploadReq.id).\(ext.isEmpty ? "mp3" : ext)"
+        // 废弃接口：真实可播放地址应通过 uploadAndGetPlayableURL 取得，
+        // 此处不拼假地址（cdn1.suno.ai/{id}.mp3 是无效地址，必然静音），返回空字符串
+        let audioUrl = ""
         return AudioUploadResult(uploadId: uploadReq.id, audioUrl: audioUrl)
     }
 
@@ -337,6 +347,27 @@ struct SunoAPI {
         }
     }
 
+    /// 对齐 SunoTools backend.py：initialize-clip 后用 set_metadata 激活 clip
+    /// （接受音频上传 TOS is_audio_upload_tos_accepted=true），让 clip 真正可播放、能进「音乐库」。
+    /// 失败不影响主流程（仅警告），与 SunoTools「初始化跳过」的容错行为一致。
+    private func setClipMetadata(clipId: String, title: String, imageUrl: String?) async {
+        let url = URL(string: "\(SunoAPI.base)/api/gen/\(clipId)/set_metadata/")!
+        var req = makeRequest(url, method: "POST")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: Any] = [
+            "title": title,
+            "image_url": imageUrl ?? NSNull(),
+            "is_audio_upload_tos_accepted": true
+        ]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        do {
+            _ = try await Self.performDataRequest(req)
+            DebugLog.shared.info("上传", "set_metadata 成功 clipId=\(clipId.prefix(8))")
+        } catch {
+            DebugLog.shared.warning("上传", "set_metadata 失败（忽略）：\(error.localizedDescription)")
+        }
+    }
+
     /// 完整上传 + 注册流程（对齐 SunoTools 真实逻辑）：
     ///   init(studio_file_upload) → S3 → upload-finish(studio_file_upload)
     ///   → 轮询到 complete(且 s3_id 存在) → initialize-clip → feed/v3 取真实 audio_url
@@ -361,7 +392,7 @@ struct SunoAPI {
         progress?("③ 通知 Suno 开始处理…")
         try await confirmUploadFinish(uploadId: uploadReq.id, fileName: fileName)
 
-        // 轮询处理状态（每 3 秒一次，最长 ~10 分钟）
+        // 轮询处理状态（每 3 秒一次，最长 ~10 分钟）：必须 status==complete 且 s3_id 存在
         progress?("④ 等待 Suno 处理音频…")
         var s3id: String?
         var lastStatus: AudioUploadStatus?
@@ -369,16 +400,28 @@ struct SunoAPI {
             let st = try await pollUploadStatus(uploadId: uploadReq.id)
             lastStatus = st
             s3id = st.s3_id
-            if st.status == "complete" { break }
+            if st.status == "complete" && st.s3_id != nil { break }
             if let s = st.status, s == "error" || s == "failed" || s == "rejected" || s == "blocked" {
                 throw SunoError.uploadFailed("音频处理失败：\(s)")
             }
             try? await Task.sleep(nanoseconds: 3_000_000_000)
         }
 
-        // Step 4：initialize-clip 拿 clipId
+        // Step 4：initialize-clip 拿 clipId（对齐 SunoTools：失败用 s3_id 兜底，绝不整段崩）
         progress?("⑤ 注册为可播放歌曲…")
-        let clipId = try await initializeClip(uploadId: uploadReq.id)
+        var clipId: String
+        do {
+            clipId = try await initializeClip(uploadId: uploadReq.id)
+        } catch {
+            DebugLog.shared.warning("上传", "initialize-clip 失败(\(error.localizedDescription))，尝试用 s3_id 兜底")
+            guard let sid = s3id, !sid.isEmpty else {
+                throw SunoError.uploadFailed("initialize-clip 失败且无 s3_id 兜底：\(error.localizedDescription)")
+            }
+            clipId = sid
+        }
+
+        // 对齐 SunoTools：initialize-clip 后调 set_metadata 激活 clip（接受音频上传 TOS），让其真正可播放
+        await setClipMetadata(clipId: clipId, title: (fileName as NSString).deletingPathExtension, imageUrl: lastStatus?.image_url)
 
         // Step 5：取真实 audio_url（稍等 clip 进 feed，最多 ~50 秒）
         var audioUrl = ""
@@ -389,12 +432,11 @@ struct SunoAPI {
             }
             try? await Task.sleep(nanoseconds: 2_000_000_000)
         }
-        // 兜底：若 feed 暂未就绪，用 upload 状态里的 audio_url（部分接口直接给）；再不行用 s3_id 兜底拼
+        // 兜底：若 feed 暂未就绪，用 upload 状态里直接给的 audio_url；不再手拼假地址（假地址必然静音）
         if audioUrl.isEmpty { audioUrl = lastStatus?.audio_url ?? "" }
-        if audioUrl.isEmpty, let sid = s3id {
-            audioUrl = "https://cdn1.suno.ai/\(sid).mp3"
-        }
-        progress?("✅ 上传完成，可播放地址已获取")
+        progress?(audioUrl.isEmpty
+                  ? "✅ 上传完成（音频已注册，真实地址稍后可在「已上传」页点「刷新地址」获取）"
+                  : "✅ 上传完成，可播放地址已获取")
 
         return UploadedAudioResult(uploadId: uploadReq.id, clipId: clipId, audioUrl: audioUrl)
     }
