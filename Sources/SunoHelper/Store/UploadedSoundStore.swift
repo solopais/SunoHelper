@@ -41,8 +41,8 @@ final class UploadedSoundStore: ObservableObject {
     func add(id: String, name: String, url: String, data: Data) {
         let ext = (name as NSString).pathExtension.lowercased().isEmpty ? "mp3" : (name as NSString).pathExtension.lowercased()
         let fname = "\(id).\(ext)"
-        let url = dir.appendingPathComponent(fname)
-        try? data.write(to: url)
+        let fileURL = dir.appendingPathComponent(fname)
+        try? data.write(to: fileURL)
         let item = UploadedSound(id: id, name: name, fileName: fname, url: url, date: Date())
         DispatchQueue.main.async {
             if !self.items.contains(where: { $0.id == id }) {
