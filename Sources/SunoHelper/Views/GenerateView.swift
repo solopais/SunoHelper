@@ -799,8 +799,7 @@ private struct SliderRow: View {
 // MARK: - 上传音频信息载体
 struct UploadedAudioInfo {
     let id: String
-    let url: String        // CDN 地址（可能延迟可用）
-    let localURL: String?  // 本地文件路径（试听优先用，立即可用）
+    let url: String        // Suno 处理后的 CDN 地址（试听 / 翻唱都以此为基准）
     let name: String
     let note: String?      // 非阻塞提示（如超时兜底/404 兜底）
 }
@@ -869,7 +868,6 @@ extension GenerateView {
                 await MainActor.run {
                     uploadedAudio = UploadedAudioInfo(
                         id: uploadReq.id, url: cdn,
-                        localURL: pickedAudioURL?.path,
                         name: fileName,
                         note: timedOut ? "⏳ 音频仍在处理中，已用上传地址兜底，可直接翻唱（若失败稍后重试）"
                                 : (pollErrored404 ? "✅ Suno 已处理完音频（轮询返回 404 视为完成），可直接翻唱" : nil)
@@ -933,10 +931,11 @@ struct UploadedAudioView: View {
                     }
 
                     Button(action: {
-                        // 优先用本地文件（立即可用），fallback 到 CDN
-                        let playURL = info.localURL ?? info.url
+                        // 试听「上传后的」版本：Suno 处理完的 CDN 音频。
+                        // 本地原文件的安全作用域在 fileImporter 回调结束后已释放，AVPlayer 无法访问，播放无效，故只用 CDN 版。
+                        let playURL = info.url
                         AudioPlayer.shared.toggle(url: playURL)
-                        playMsg = info.localURL != nil ? "▶ 正在播放本地文件" : "▶ 正在播放（CDN 加载中…）"
+                        playMsg = "▶ 正在播放已上传的音频（Suno 处理版）"
                     }) {
                         Label("试听上传的音频", systemImage: "play.circle")
                             .font(.subheadline)
@@ -1024,21 +1023,23 @@ struct UploadedAudioView: View {
                 // 关键修复：AUDIO 模式下，用户输入是「风格提示词」不是歌词
                 // prompt="" 让 Suno 自动生成歌词；用户的描述走 gpt_description_prompt（风格提示词）
                 var p = GeneratePayload(
-                    make_instrumental: instrumental,
+                    make_instrumental: instrumental,   // 用户勾选才纯音乐；不勾选即带人声（simple 模式同理，空 prompt 不会变纯音乐）
                     mv: model,
-                    prompt: "",   // 不指定歌词 → Suno 自动生成（之前错误地把用户输入当歌词塞这里）
+                    prompt: "",   // AUDIO 模式不指定歌词 → Suno 自动生成
                     tags: tags.isEmpty ? nil : tags,
                     title: title.isEmpty ? nil : title
                 )
                 p.generation_type = "AUDIO"
-                p.gpt_description_prompt = prompt.isEmpty ? nil : prompt  // 风格提示词
+                p.gpt_description_prompt = prompt.isEmpty ? nil : prompt  // 风格提示词（留空则 Suno 仅依据音频风格生成）
+                // 仅用 audio_condition 作为风格参考（现代接口）。
+                // ⚠️ 不要同时设顶层 audio_url：旧字段会让 Suno 走另一路径、忽略 audio_condition，导致「与上传无关」
                 p.audio_condition = AudioCondition(
                     id: info.id,
                     status: "complete",
                     url: info.url,
                     type: "audio"
                 )
-                p.audio_url = info.url
+                DebugLog.shared.info("翻唱", "提交 generation_type=AUDIO make_instrumental=\(p.make_instrumental) gpt=\(p.gpt_description_prompt ?? "<空>") audio=\(info.id.prefix(8))")
                 let stubs = try await SunoAPI.shared.generate(payload: p)
                 let ids = stubs.map { $0.id }
                 var finished = false
