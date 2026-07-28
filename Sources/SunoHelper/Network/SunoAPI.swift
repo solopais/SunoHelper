@@ -313,7 +313,8 @@ struct SunoAPI {
 
     /// Step 5：通过 feed/v3 拉取该 clip 的真实可播放地址（audio_url）。
     /// 对应 SunoTools backend.py：POST /api/feed/v3 {filters:{ids:{presence:"True",clipIds:[clipId]}},limit:1}
-    private func fetchClipAudioURL(clipId: String) async throws -> String {
+    /// 供「已上传」列表的「刷新地址」按钮复用，故为 internal。
+    func fetchClipAudioURL(clipId: String) async throws -> String {
         try await run {
             let url = URL(string: "\(SunoAPI.base)/api/feed/v3")!
             var req = makeRequest(url, method: "POST")
