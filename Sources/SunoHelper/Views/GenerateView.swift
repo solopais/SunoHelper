@@ -799,8 +799,9 @@ private struct SliderRow: View {
 // MARK: - 上传音频信息载体
 struct UploadedAudioInfo {
     let id: String
-    let url: String        // Suno 处理后的 CDN 地址（试听 / 翻唱都以此为基准）
+    let url: String        // Suno 处理后的 CDN 地址（可能不可用，仅作 generate 引用）
     let name: String
+    let localData: Data?   // 原始音频文件数据（用于试听，立即可用、确定有声音）
     let note: String?      // 非阻塞提示（如超时兜底/404 兜底）
 }
 
@@ -869,6 +870,7 @@ extension GenerateView {
                     uploadedAudio = UploadedAudioInfo(
                         id: uploadReq.id, url: cdn,
                         name: fileName,
+                        localData: pickedAudioData,  // 保留原始数据用于试听（CDN URL 可能不可用）
                         note: timedOut ? "⏳ 音频仍在处理中，已用上传地址兜底，可直接翻唱（若失败稍后重试）"
                                 : (pollErrored404 ? "✅ Suno 已处理完音频（轮询返回 404 视为完成），可直接翻唱" : nil)
                     )
@@ -931,11 +933,15 @@ struct UploadedAudioView: View {
                     }
 
                     Button(action: {
-                        // 试听「上传后的」版本：Suno 处理完的 CDN 音频。
-                        // 本地原文件的安全作用域在 fileImporter 回调结束后已释放，AVPlayer 无法访问，播放无效，故只用 CDN 版。
-                        let playURL = info.url
-                        AudioPlayer.shared.toggle(url: playURL)
-                        playMsg = "▶ 正在播放已上传的音频（Suno 处理版）"
+                        // 优先用本地原始音频数据（立即可用、确定有声音）。
+                        // CDN URL (info.url) 是拼接的兜底地址，很可能不存在 → AVPlayer 静默无声音。
+                        if let data = info.localData {
+                            AudioPlayer.shared.playFromData(data, fileName: info.name)
+                            playMsg = "▶ 正在播放本地原始音频"
+                        } else {
+                            AudioPlayer.shared.toggle(url: info.url)
+                            playMsg = "▶ 正在播放（CDN 加载中…）"
+                        }
                     }) {
                         Label("试听上传的音频", systemImage: "play.circle")
                             .font(.subheadline)
@@ -1023,14 +1029,24 @@ struct UploadedAudioView: View {
                 // 关键修复：AUDIO 模式下，用户输入是「风格提示词」不是歌词
                 // prompt="" 让 Suno 自动生成歌词；用户的描述走 gpt_description_prompt（风格提示词）
                 var p = GeneratePayload(
-                    make_instrumental: instrumental,   // 用户勾选才纯音乐；不勾选即带人声（simple 模式同理，空 prompt 不会变纯音乐）
+                    make_instrumental: instrumental,   // 用户勾选才纯音乐；不勾选即带人声
                     mv: model,
                     prompt: "",   // AUDIO 模式不指定歌词 → Suno 自动生成
                     tags: tags.isEmpty ? nil : tags,
                     title: title.isEmpty ? nil : title
                 )
                 p.generation_type = "AUDIO"
-                p.gpt_description_prompt = prompt.isEmpty ? nil : prompt  // 风格提示词（留空则 Suno 仅依据音频风格生成）
+
+                // ⚠️ gpt_description_prompt 不能全空！否则 Suno 没有「生成方向」可能 fallback 到纯音乐默认行为。
+                // 用户填了什么就用什么；没填但填了标题 → 用标题作提示；全空 → 给一个弱默认提示。
+                if !prompt.isEmpty {
+                    p.gpt_description_prompt = prompt
+                } else if !title.isEmpty {
+                    p.gpt_description_prompt = "A song in the style of the reference audio, titled \"\(title)\""
+                } else {
+                    p.gpt_description_prompt = "A song in the style of the reference audio"
+                }
+
                 // 仅用 audio_condition 作为风格参考（现代接口）。
                 // ⚠️ 不要同时设顶层 audio_url：旧字段会让 Suno 走另一路径、忽略 audio_condition，导致「与上传无关」
                 p.audio_condition = AudioCondition(
@@ -1039,7 +1055,15 @@ struct UploadedAudioView: View {
                     url: info.url,
                     type: "audio"
                 )
-                DebugLog.shared.info("翻唱", "提交 generation_type=AUDIO make_instrumental=\(p.make_instrumental) gpt=\(p.gpt_description_prompt ?? "<空>") audio=\(info.id.prefix(8))")
+                // 最高音频保真度（1.0 = 尽可能贴近参考音频的风格/音色）
+                p.audio_weight = 1.0
+
+                // 打印完整 payload JSON 用于诊断（脱敏 URL 不打印完整值）
+                if let jsonData = try? JSONEncoder().encode(p),
+                   let jsonStr = String(data: jsonData, encoding: .utf8) {
+                    DebugLog.shared.info("翻唱", "完整 payload: \(jsonStr.prefix(500))")
+                }
+                DebugLog.shared.info("翻唱", "提交 generation_type=AUDIO make_instrumental=\(p.make_instrumental) audio_weight=\(p.audio_weight ?? -1) gpt=\(p.gpt_description_prompt?.prefix(80) ?? "<空>") audio=\(info.id.prefix(8))")
                 let stubs = try await SunoAPI.shared.generate(payload: p)
                 let ids = stubs.map { $0.id }
                 var finished = false

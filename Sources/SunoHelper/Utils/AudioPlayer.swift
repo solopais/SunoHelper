@@ -23,6 +23,26 @@ final class AudioPlayer: ObservableObject {
         }
     }
 
+    /// 从内存中的 Data 直接播放（用于上传后试听原始音频，不依赖 CDN URL）
+    func playFromData(_ data: Data, fileName: String = "audio.mp3") {
+        player?.pause()
+        removeObserver()
+
+        // 写入临时文件（AVPlayer 需要 file:// URL）
+        let tmpDir = FileManager.default.temporaryDirectory
+        let ext = (fileName as NSString).pathExtension.isEmpty ? "mp3" : (fileName as NSString).pathExtension
+        let tmpName = "suno_preview_\(Int(Date().timeIntervalSince1970 * 1000)).\(ext)"
+        let tmpURL = tmpDir.appendingPathComponent(tmpName)
+
+        do {
+            try data.write(to: tmpURL, options: .atomic)
+            loadAndPlay(tmpURL.absoluteString)
+        } catch {
+            // 写入失败时 fallback：尝试用无文件 URL 的方式（不会成功但避免崩溃）
+            DebugLog.shared.error("播放", "写入临时文件失败: \(error.localizedDescription)")
+        }
+    }
+
     private func loadAndPlay(_ url: String) {
         player?.pause()
         removeObserver()
