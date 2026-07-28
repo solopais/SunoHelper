@@ -104,13 +104,13 @@ struct SunoAPI {
         var lastError: Error?
         for attempt in 1...maxAttempts {
             do {
-                return try await Self.performDataRequest(req)
+                return try await URLSession.shared.data(for: req)
             } catch {
                 if attempt < maxAttempts,
                    let urlErr = error as? URLError,
                    retryable.contains(urlErr.code) {
                     DebugLog.shared.info("网络", "瞬时连接错误[\(urlErr.errorCode)] 第\(attempt)次，重试...")
-                    let backoff = attempt == 1 ? 1_000_000_000 : 2_000_000_000
+                    let backoff: UInt64 = attempt == 1 ? 1_000_000_000 : 2_000_000_000
                     try? await Task.sleep(nanoseconds: backoff)
                     lastError = error
                     continue
