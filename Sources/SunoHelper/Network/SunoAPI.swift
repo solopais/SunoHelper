@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 enum SunoError: LocalizedError {
     case authExpired
@@ -61,6 +62,20 @@ struct SunoAPI {
     static let base = "https://studio-api.prod.suno.com"
     static let shared = SunoAPI()
 
+    // 对齐 SunoTools backend.py browser_token()：{"token": base64({"timestamp": <毫秒>})}
+    // 服务端鉴权强依赖此头，缺失会导致上传接口拒收 / 音频不注册（之前 iOS 版一直没带 → 上传"看不见"）。
+    static func browserToken() -> String {
+        let ts = Int64(Date().timeIntervalSince1970 * 1000)
+        let inner = "{\"timestamp\":\(ts)}".data(using: .utf8) ?? Data()
+        let b64 = inner.base64EncodedString()
+        return "{\"token\":\"\(b64)\"}"
+    }
+
+    // Device-Id（可选，对齐 SunoTools 的 ajs_anonymous_id；clean_device_id 后仅保留字母数字-）
+    static func deviceId() -> String? {
+        UIDevice.current.identifierForVendor?.uuidString
+    }
+
     private func makeRequest(_ url: URL, method: String = "GET",
                              body: Data? = nil) -> URLRequest {
         var req = URLRequest(url: url)
@@ -68,6 +83,11 @@ struct SunoAPI {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("https://suno.com/", forHTTPHeaderField: "Referer")
         req.setValue("https://suno.com", forHTTPHeaderField: "Origin")
+        // 关键：每个 Suno API 请求都带 Browser-Token
+        req.setValue(SunoAPI.browserToken(), forHTTPHeaderField: "Browser-Token")
+        if let did = SunoAPI.deviceId(), !did.isEmpty {
+            req.setValue(did, forHTTPHeaderField: "Device-Id")
+        }
         for (k, v) in SunoSession.shared.authHeaders() {
             req.setValue(v, forHTTPHeaderField: k)
         }
@@ -140,6 +160,10 @@ struct SunoAPI {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.setValue("https://suno.com/", forHTTPHeaderField: "Referer")
             req.setValue("https://suno.com", forHTTPHeaderField: "Origin")
+            req.setValue(SunoAPI.browserToken(), forHTTPHeaderField: "Browser-Token")
+            if let did = SunoAPI.deviceId(), !did.isEmpty {
+                req.setValue(did, forHTTPHeaderField: "Device-Id")
+            }
             for (k, v) in SunoSession.shared.authHeaders() {
                 req.setValue(v, forHTTPHeaderField: k)
             }
@@ -191,45 +215,12 @@ struct SunoAPI {
     }
 
     /// Step 2.5: 报告上传完毕（通知 Suno 服务器 S3 文件已上传完成，开始处理音频）
-    /// ⚠️ 缺少此步骤会导致轮询永远 processing（服务器不知道文件已就绪）
-    /// 对应网页端流程第 3 步：POST /api/uploads/audio/{id}/upload-finish
-    ///
-    /// ⚠️ 关键修复：upload-finish 是非幂等的「开始处理」指令，绝不能被网络层盲目重试。
-    /// 旧逻辑走通用 -1005 重试（最多 3 次），而 -1005 是「连接中途断开」——服务端很可能
-    /// 已经收到并处理了第一次请求，重试的第二次会触发重复处理 → Suno 音频处理直接 status=error。
-    /// 新逻辑：只发一次（maxAttempts=1）；若失败（含 -1005），先轮询该上传 id 是否已存在：
-    ///   - 已存在（任意状态）→ 说明 upload-finish 已生效，直接视为成功，绝不再重发；
-    ///   - 404（不存在）→ 仅补发一次。
-    /// 这样无论 -1005 是否已被服务端处理，最多只会产生一次有效的 upload-finish。
+    /// 对应 SunoTools backend.py：POST /api/uploads/audio/{id}/upload-finish/ {upload_type, upload_filename}
+    /// 对齐 SunoTools：单次发送即可（client.api 仅对连接级错误自动重试），
+    /// 不臆测「-1005 已处理」去做轮询补发——那会引入重复处理风险。
     func confirmUploadFinish(uploadId: String, fileName: String) async throws {
-        do {
-            try await performUploadFinishOnce(uploadId: uploadId, fileName: fileName)
-            DebugLog.shared.success("上传", "upload-finish 成功（Suno 开始处理音频）")
-        } catch {
-            // 连接级错误（-1005 等）时请求可能已被 Suno 处理。安全校验：轮询该上传状态。
-            DebugLog.shared.info("上传", "upload-finish 异常(\(error.localizedDescription))，校验上传状态…")
-            do {
-                let st = try await pollUploadStatus(uploadId: uploadId)
-                let begun = (st.status ?? "uploaded").lowercased()
-                if begun == "processing" || begun == "complete" || begun == "passed_audio_processing" {
-                    // 已开始处理（或完成）→ 说明 finish 已生效，视为成功，绝不重复发送
-                    DebugLog.shared.info("上传", "upload-finish 校验：音频已开始处理(status=\(st.status ?? "?"))，视为已完成")
-                    return
-                }
-                // status 仍为 uploaded/pending/created（未开始处理）→ finish 实际未送达，补发一次
-                DebugLog.shared.info("上传", "upload-finish 校验：id 存在但 status=\(st.status ?? "?")（未开始处理），补发一次")
-                try await performUploadFinishOnce(uploadId: uploadId, fileName: fileName)
-                DebugLog.shared.success("上传", "upload-finish 补发成功")
-            } catch let SunoError.http(code, _) where code == 404 {
-                // 确实未注册 → 仅补发一次（同样不重试，避免再触发重复处理）
-                DebugLog.shared.info("上传", "upload-finish 校验：id 不存在(404)，补发一次")
-                try await performUploadFinishOnce(uploadId: uploadId, fileName: fileName)
-                DebugLog.shared.success("上传", "upload-finish 补发成功")
-            } catch {
-                // 校验也失败 → 抛出原始错误
-                throw error
-            }
-        }
+        try await performUploadFinishOnce(uploadId: uploadId, fileName: fileName)
+        DebugLog.shared.success("上传", "upload-finish 成功（Suno 开始处理音频）")
     }
 
     /// 单次发送 upload-finish（不重试）。失败由 confirmUploadFinish 统一做安全校验。
@@ -332,6 +323,7 @@ struct SunoAPI {
 
     /// Step 5：通过 feed/v3 拉取该 clip 的真实可播放地址（audio_url）。
     /// 对应 SunoTools backend.py：POST /api/feed/v3 {filters:{ids:{presence:"True",clipIds:[clipId]}},limit:1}
+    /// 优先 audio_url；其次 media_urls[].url（对齐 SunoTools fetch_clip_by_id 的兜底）。
     /// 供「已上传」列表的「刷新地址」按钮复用，故为 internal。
     func fetchClipAudioURL(clipId: String) async throws -> String {
         try await run {
@@ -346,13 +338,37 @@ struct SunoAPI {
             DebugLog.shared.info("上传", "Step5 POST /feed/v3 取 audio_url clipId=\(clipId.prefix(8))")
             let (data, resp) = try await Self.performDataRequest(req)
             try Self.check(resp: resp, data: data)
-            let wrapped = try? JSONDecoder().decode(SunoFeedResponse.self, from: data)
-            let audioURL = wrapped?.clips.first?.audio_url
-            DebugLog.shared.success("上传", "feed/v3 取到 audio_url=\(audioURL?.prefix(40) ?? "<空>")")
-            guard let u = audioURL, !u.isEmpty else {
-                throw SunoError.uploadFailed("feed/v3 未返回 audio_url")
+
+            // 优先 audio_url；其次 media_urls[].url
+            if let loose = try? JSONDecoder().decode(FeedClipLoose.self, from: data),
+               let first = loose.clips.first {
+                if let u = first.audio_url, !u.isEmpty {
+                    DebugLog.shared.success("上传", "feed/v3 取到 audio_url=\(u.prefix(40))")
+                    return u
+                }
+                if let u = first.media_urls?.first?.url, !u.isEmpty {
+                    DebugLog.shared.success("上传", "feed/v3 取到 media_urls[0].url=\(u.prefix(40))")
+                    return u
+                }
             }
-            return u
+            if let wrapped = try? JSONDecoder().decode(SunoFeedResponse.self, from: data),
+               let u = wrapped.clips.first?.audio_url, !u.isEmpty {
+                DebugLog.shared.success("上传", "feed/v3 取到 audio_url=\(u.prefix(40))")
+                return u
+            }
+            throw SunoError.uploadFailed("feed/v3 未返回 audio_url")
+        }
+    }
+
+    /// feed/v3 松散解析（仅取播放地址相关字段，兼容 media_urls 兜底）
+    private struct FeedClipLoose: Decodable {
+        let clips: [ClipAudioLoose]
+        struct ClipAudioLoose: Decodable {
+            let audio_url: String?
+            let media_urls: [MediaURLLoose]?
+        }
+        struct MediaURLLoose: Decodable {
+            let url: String?
         }
     }
 
@@ -400,26 +416,35 @@ struct SunoAPI {
     /// 任意环节失败都返回「部分结果」（url/clipId 可能为空），交由 UI「刷新地址」补救。
     /// 轮询中 Suno 返回 404（记录已清理 = 处理完或彻底失败）视为可跳出，绝不让 404 穿透上层。
     func resolveUploadedAudioURL(uploadId: String, fileName: String) async -> UploadedAudioResult {
-        // 轮询处理状态（每 3 秒，最长 ~20 分钟）；404 视为 Suno 已清理记录 → 跳出
+        // 轮询处理状态（每 3 秒，最长 ~10 分钟）
+        // ⚠️ 对齐 SunoTools backend.py：轮询时 404 / 异常都视为「记录尚未就绪」，继续重试，绝不跳出。
+        // 之前 iOS 版把 404 当作「处理完」直接 break → 立刻对未就绪的上传调 initialize-clip → 失败 → clipId 空 → 只能播本地。
         var s3id: String?
         var lastStatus: AudioUploadStatus?
-        for _ in 0..<400 {
+        var reachedComplete = false
+        for i in 0..<200 {
             do {
                 let st = try await pollUploadStatus(uploadId: uploadId)
                 lastStatus = st
                 s3id = st.s3_id
-                if st.status == "complete" && st.s3_id != nil { break }
+                if st.status == "complete", let sid = st.s3_id, !sid.isEmpty {
+                    reachedComplete = true
+                    break
+                }
                 if let s = st.status, ["error", "failed", "rejected", "blocked"].contains(s) {
                     DebugLog.shared.error("上传", "音频处理失败(status=\(s))")
                     break
                 }
             } catch let SunoError.http(404, _) {
-                DebugLog.shared.info("上传", "轮询获 404（Suno 已清理记录），跳出轮询尝试注册 clip")
-                break
+                // SunoTools：404 表示 Suno 还没建好该上传的状态记录 → 继续等
+                DebugLog.shared.info("上传", "轮询 404（记录尚未就绪），继续重试 (\(i))")
             } catch {
-                // 瞬时错误，继续等
+                DebugLog.shared.info("上传", "轮询瞬时错误，继续重试：\(error.localizedDescription)")
             }
             try? await Task.sleep(nanoseconds: 3_000_000_000)
+        }
+        if !reachedComplete {
+            DebugLog.shared.info("上传", "轮询未确认 complete（可能 Suno 仍在处理），仍前往 initialize-clip 兜底")
         }
 
         // Step 4：initialize-clip（容错：失败用 s3_id 兜底，再不行就留空由刷新补救）
