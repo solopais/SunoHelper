@@ -104,7 +104,7 @@ struct SunoAPI {
         var lastError: Error?
         for attempt in 1...maxAttempts {
             do {
-                return try await URLSession.shared.data(for: req)
+                return try await Self.performDataRequest(req)
             } catch {
                 if attempt < maxAttempts,
                    let urlErr = error as? URLError,
