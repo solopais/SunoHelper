@@ -831,10 +831,24 @@ extension GenerateView {
                 var rounds = 0
                 let maxRounds = 200            // 200 × 3s ≈ 10 分钟
                 var status: AudioUploadStatus?
+                var pollErrored404 = false     // Suno 处理完会删除上传资源 → 轮询 404，视为完成
                 while rounds < maxRounds {
                     try await Task.sleep(nanoseconds: 3_000_000_000)
                     rounds += 1
-                    status = try await SunoAPI.shared.pollUploadStatus(uploadId: uploadReq.id)
+                    do {
+                        status = try await SunoAPI.shared.pollUploadStatus(uploadId: uploadReq.id)
+                        pollErrored404 = false
+                    } catch let SunoError.http(code, _) where code == 404 {
+                        // Suno 处理完音频后会删除该上传资源，轮询接口返回 404。
+                        // 这通常代表音频已就绪（而非失败），直接以 id 拼 CDN 地址兜底视为完成。
+                        DebugLog.shared.warning("上传", "轮询 404（视为处理完成）: \(uploadReq.id)")
+                        pollErrored404 = true
+                        status = AudioUploadStatus(id: uploadReq.id, status: "complete", title: nil, audio_url: nil, copyright_muted: nil)
+                        break
+                    } catch {
+                        // 其他瞬时错误（如 -1005 抖动）视为仍在处理，继续等待
+                        DebugLog.shared.warning("上传", "轮询异常(继续等待): \(error.localizedDescription)")
+                    }
                     await MainActor.run { uploadMsg = "Suno 处理音频中（\(rounds)/\(maxRounds)）…" }
                     if status?.status != "processing" { break }
                 }
@@ -842,7 +856,7 @@ extension GenerateView {
                 guard finalStatus != "error" else {
                     throw SunoError.uploadFailed("音频处理失败：status=error")
                 }
-                // 超时仍未 complete：不丢弃上传，用 id 拼出 CDN 地址兜底继续翻唱
+                // 超时/404 兜底：不丢弃上传，用 id 拼出 CDN 地址继续翻唱
                 // （Suno 通常仍在后台处理该资源，generate 引用 id 即可）
                 let cdn = status?.audio_url
                     ?? "https://cdn1.suno.ai/\(uploadReq.id).\(ext.isEmpty ? "mp3" : ext)"
@@ -850,7 +864,8 @@ extension GenerateView {
                 await MainActor.run {
                     uploadedAudio = UploadedAudioInfo(
                         id: uploadReq.id, url: cdn, name: fileName,
-                        note: timedOut ? "⏳ 音频仍在处理中，已用上传地址兜底，可直接翻唱（若失败稍后重试）" : nil
+                        note: timedOut ? "⏳ 音频仍在处理中，已用上传地址兜底，可直接翻唱（若失败稍后重试）"
+                                : (pollErrored404 ? "✅ Suno 已处理完音频（轮询返回 404 视为完成），可直接翻唱" : nil)
                     )
                     uploadingAudio = false
                     showUploadedAudio = true
