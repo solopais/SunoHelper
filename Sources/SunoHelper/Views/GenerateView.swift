@@ -913,10 +913,14 @@ struct UploadedAudioView: View {
                     }
 
                     Button(action: {
-                        // 优先播 Suno 真实处理版（真实 audio_url）；地址暂未就绪则兜底播本地原文件
+                        // 优先播 Suno 真实处理版（真实 audio_url）；其次用 clipId(uuid) 拼 Suno CDN 直链；最后兜底本地原文件
                         if !info.url.isEmpty {
                             AudioPlayer.shared.toggle(url: info.url)
                             playMsg = "▶ 正在播放（Suno 处理版）"
+                        } else if !info.clipId.isEmpty {
+                            let cdn = "https://cdn1.suno.ai/\(info.clipId).mp3"
+                            AudioPlayer.shared.toggle(url: cdn)
+                            playMsg = "▶ 正在播放（Suno 处理版·直链兜底）"
                         } else if let d = info.localData {
                             AudioPlayer.shared.playFromData(d, fileName: info.name)
                             playMsg = "▶ 正在播放（本地原文件，Suno 地址暂未就绪）"

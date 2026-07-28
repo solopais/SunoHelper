@@ -310,12 +310,21 @@ struct SunoAPI {
             DebugLog.shared.info("上传", "Step4 POST /initialize-clip id=\(uploadId.prefix(8))")
             let (data, resp) = try await Self.performDataRequest(req)
             try Self.check(resp: resp, data: data)
-            struct Resp: Decodable { let clip_id: String?; let id: String? }
-            let decoded = try? JSONDecoder().decode(Resp.self, from: data)
-            let clipId = decoded?.clip_id ?? decoded?.id
-            DebugLog.shared.success("上传", "initialize-clip 成功 clipId=\(clipId?.prefix(8) ?? "<空>")")
+            // 诊断：打印原始响应，定位真实字段名
+            let raw = String(data: data, encoding: .utf8) ?? "<二进制响应>"
+            DebugLog.shared.info("上传", "initialize-clip 原始响应: \(raw.prefix(500))")
+            // 宽松解析：兼容 clip_id / id / clipId / song_id 多种命名
+            struct Flat: Decodable {
+                let clip_id: String?
+                let id: String?
+                let clipId: String?
+                let song_id: String?
+            }
+            let f = try? JSONDecoder().decode(Flat.self, from: data)
+            let clipId = f?.clip_id ?? f?.id ?? f?.clipId ?? f?.song_id
+            DebugLog.shared.success("上传", "initialize-clip 解析到 clipId=\(clipId?.prefix(8) ?? "<空>")")
             guard let cid = clipId else {
-                throw SunoError.uploadFailed("initialize-clip 未返回 clipId")
+                throw SunoError.uploadFailed("initialize-clip 未返回 clipId（响应: \(raw.prefix(200))）")
             }
             return cid
         }
@@ -426,7 +435,7 @@ struct SunoAPI {
             await setClipMetadata(clipId: clipId, title: (fileName as NSString).deletingPathExtension, imageUrl: lastStatus?.image_url)
         }
 
-        // Step 5：取真实 audio_url（容错）
+        // Step 5：取真实 audio_url（来自 feed/v3 的 audio_url 字段，即 Suno CDN 直链）
         var audioUrl = ""
         if !clipId.isEmpty {
             for _ in 0..<24 {
@@ -436,33 +445,35 @@ struct SunoAPI {
                 }
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
+        }
+        // 兜底：用 clipId(uuid) 拼 Suno CDN 直链（修正此前用 upload_id 短 id 拼的致命错误；
+        // feed/v3 取不到时，uuid 直链通常可用）
+        if audioUrl.isEmpty, !clipId.isEmpty {
+            audioUrl = "https://cdn1.suno.ai/\(clipId).mp3"
+            DebugLog.shared.info("上传", "feed 未取到 audio_url，用 clipId 兜底拼 cdn1.suno.ai/\(clipId.prefix(8)).mp3")
         }
         if audioUrl.isEmpty { audioUrl = lastStatus?.audio_url ?? "" }
         DebugLog.shared.info("上传", "resolve 完成：clipId=\(clipId.prefix(8)) url=\(audioUrl.prefix(20))")
         return UploadedAudioResult(uploadId: uploadId, clipId: clipId, audioUrl: audioUrl)
     }
 
-    /// 「已上传」页「刷新地址」复用：用 uploadId 重走 initialize-clip → feed/v3（clipId 为空也能补救）。
-    func fetchPlayableURLByUploadId(uploadId: String) async -> (clipId: String, audioUrl: String) {
-        var clipId = ""
-        if let cid = try? await initializeClip(uploadId: uploadId) { clipId = cid }
-        var audioUrl = ""
-        if !clipId.isEmpty {
-            await setClipMetadata(clipId: clipId, title: "", imageUrl: nil)
+    /// 「已上传」页「刷新地址」复用：优先用已存 clipId 直接查 feed/v3（不重复 initialize-clip，避免重复创建 clip）；
+    /// 若 clipId 为空则走完整 resolve（含 poll→initialize→feed）。
+    func fetchPlayableURLByUploadId(uploadId: String, clipId existingClipId: String, fileName: String) async -> (clipId: String, audioUrl: String) {
+        if !existingClipId.isEmpty {
+            var audioUrl = ""
             for _ in 0..<24 {
-                if let u = try? await fetchClipAudioURL(clipId: clipId), !u.isEmpty {
+                if let u = try? await fetchClipAudioURL(clipId: existingClipId), !u.isEmpty {
                     audioUrl = u
                     break
                 }
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
+            if audioUrl.isEmpty { audioUrl = "https://cdn1.suno.ai/\(existingClipId).mp3" }
+            return (existingClipId, audioUrl)
         }
-        if audioUrl.isEmpty {
-            if let st = try? await pollUploadStatus(uploadId: uploadId), let u = st.audio_url, !u.isEmpty {
-                audioUrl = u
-            }
-        }
-        return (clipId, audioUrl)
+        let r = await resolveUploadedAudioURL(uploadId: uploadId, fileName: fileName)
+        return (r.clipId, r.audioUrl)
     }
 
     /// 完整上传 + 注册流程（兼容入口）：beginUpload → resolveUploadedAudioURL。

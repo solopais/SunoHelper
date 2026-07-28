@@ -126,7 +126,9 @@ struct UploadedView: View {
         refreshingIDs.insert(item.id)
         playMsg[item.id] = nil
         defer { refreshingIDs.remove(item.id) }
-        let result = await SunoAPI.shared.fetchPlayableURLByUploadId(uploadId: item.id)
+        let result = await SunoAPI.shared.fetchPlayableURLByUploadId(
+            uploadId: item.id, clipId: item.clipId, fileName: item.fileName
+        )
         UploadedSoundStore.shared.update(id: item.id, clipId: result.clipId, url: result.audioUrl)
         if !result.audioUrl.isEmpty {
             playMsg[item.id] = "✅ 已取到播放地址"
