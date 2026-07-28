@@ -52,7 +52,7 @@ struct AudioUploadStatus: Decodable {
     let title: String?
     let audio_url: String?       // 处理完成后可能返回真实 CDN URL（部分接口直接给）
     let s3_id: String? = nil    // 处理完成后 Suno 分配的 clip/s3 id（initialize-clip 的上游）
-    let image_url: String?      // 处理完成后封面图（set_metadata 时用）
+    let image_url: String? = nil // 处理完成后封面图（set_metadata 时用）
     let copyright_muted: Bool?
 }
 
@@ -364,7 +364,7 @@ struct SunoAPI {
             _ = try await Self.performDataRequest(req)
             DebugLog.shared.info("上传", "set_metadata 成功 clipId=\(clipId.prefix(8))")
         } catch {
-            DebugLog.shared.warning("上传", "set_metadata 失败（忽略）：\(error.localizedDescription)")
+            DebugLog.shared.info("上传", "set_metadata 失败（忽略）：\(error.localizedDescription)")
         }
     }
 
@@ -413,7 +413,7 @@ struct SunoAPI {
         do {
             clipId = try await initializeClip(uploadId: uploadReq.id)
         } catch {
-            DebugLog.shared.warning("上传", "initialize-clip 失败(\(error.localizedDescription))，尝试用 s3_id 兜底")
+            DebugLog.shared.info("上传", "initialize-clip 失败(\(error.localizedDescription))，尝试用 s3_id 兜底")
             guard let sid = s3id, !sid.isEmpty else {
                 throw SunoError.uploadFailed("initialize-clip 失败且无 s3_id 兜底：\(error.localizedDescription)")
             }
