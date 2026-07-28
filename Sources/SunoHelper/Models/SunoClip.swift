@@ -180,6 +180,14 @@ enum VocalGender: String, CaseIterable, Identifiable {
     }
 }
 
+/// AUDIO 生成模式：作为风格参考的音频对象（Suno 真实字段，必须整体传对象，不能只把 URL 塞进 prompt）
+struct AudioCondition: Encodable {
+    let id: String
+    let status: String
+    let url: String
+    let type: String
+}
+
 // MARK: - 生成请求体（完整参数，一比一复刻网页版）
 struct GeneratePayload: Encodable {
     // === 核心参数 ===
@@ -207,6 +215,7 @@ struct GeneratePayload: Encodable {
 
     // === 音频上传参数 ===
     var audio_url: String? = nil                // 音频上传后的 CDN URL（S3 两步上传流程用）
+    var audio_condition: AudioCondition? = nil  // AUDIO 生成模式：风格参考音频对象（修复生成歌曲与上传音频无关）
 
     // === 验证相关 ===
     var token: String? = nil                   // hCaptcha token（由 WebView 注入）

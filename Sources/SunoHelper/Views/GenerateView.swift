@@ -36,6 +36,12 @@ struct GenerateView: View {
     @State private var pickedAudioName: String?      // 已选音频文件名
     @State private var pickedAudioData: Data?        // 已选音频文件数据（选择时立即读取，避免沙盒权限过期）
 
+    // === 音频自动上传 + 翻唱流程（用户需求：选文件即自动上传，成功跳转翻唱页）===
+    @State private var uploadingAudio = false
+    @State private var uploadMsg = ""
+    @State private var uploadedAudio: UploadedAudioInfo? = nil
+    @State private var showUploadedAudio = false
+
     // === 续写模式 ===
     private let extendClipID: String?
     private let coverClipID: String?       // Cover 模式：基于已有歌曲翻唱
@@ -147,6 +153,17 @@ struct GenerateView: View {
                         .padding(.horizontal, 16)
                     }
 
+                    // MARK: - 音频自动上传进度
+                    if uploadingAudio {
+                        HStack(spacing: 8) {
+                            ProgressView().tint(AppTheme.accent).scaleEffect(0.7)
+                            Text(uploadMsg)
+                                .font(.footnote)
+                                .foregroundColor(AppTheme.textSecondary)
+                        }
+                        .padding(.horizontal, 16)
+                    }
+
                     // MARK: - hCaptcha 回退按钮
                     if captchaBlocked {
                         Button(action: { showWebViewCreate = true }) {
@@ -205,6 +222,11 @@ struct GenerateView: View {
             .fullScreenCover(isPresented: $showWebViewCreate) {
                 CreateWebView()
             }
+            .fullScreenCover(isPresented: $showUploadedAudio) {
+                if let info = uploadedAudio {
+                    UploadedAudioView(info: info)
+                }
+            }
             .fileImporter(
                 isPresented: $showAudioPicker,
                 allowedContentTypes: [.audio],
@@ -221,6 +243,8 @@ struct GenerateView: View {
                             pickedAudioURL = url
                             pickedAudioName = url.lastPathComponent
                             createMode = .advanced
+                            // 用户需求：选中文件后立即自动上传，上传成功跳转翻唱页
+                            autoUploadAudio(data: data, localURL: url, fileName: url.lastPathComponent)
                         } else {
                             message = "❌ 无法读取音频文件，请重试"
                         }
@@ -244,7 +268,6 @@ struct GenerateView: View {
         if busy { return false }
         if extendClipID != nil { return true }  // 续写不需要必填
         if coverClipID != nil { return true }   // Cover 不需要必填
-        if pickedAudioData != nil { return true } // 选了音频文件即可上传，不需要 prompt
         return !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
@@ -302,103 +325,7 @@ struct GenerateView: View {
 
         Task {
             do {
-                let stubs: [SunoClipStub]
-
-                // 如果选择了音频文件，走"纯上传到音乐库"流程
-                // 用户明确要求：上传音频 → 进入音乐库 → 在音乐库点击翻唱
-                // 不是上传后直接生成
-                if let audioData = pickedAudioData, let audioURL = pickedAudioURL {
-                    let fileName = audioURL.lastPathComponent
-                    let fileSize = audioData.count
-                    DebugLog.shared.info("上传", "开始上传: \(fileName) (\(fileSize) bytes)")
-
-                    // Step 1: 获取 S3 预签名 URL
-                    await MainActor.run { message = "正在请求上传地址（1/4）…" }
-                    let uploadReq: AudioUploadRequestResponse
-                    do {
-                        let ext = (fileName as NSString).pathExtension.lowercased()
-                        uploadReq = try await SunoAPI.shared.requestAudioUpload(
-                            fileExtension: ext.isEmpty ? "mp3" : ext
-                        )
-                        DebugLog.shared.success("上传", "Step1 完成: id=\(uploadReq.id.prefix(8))")
-                    } catch {
-                        DebugLog.shared.error("上传", "Step1 失败: \(error.localizedDescription)")
-                        throw SunoError.uploadFailed("Step1 获取上传地址失败: \(error.localizedDescription)")
-                    }
-
-                    // Step 2: 上传文件到 S3
-                    await MainActor.run { message = "正在上传音频文件到 S3（2/4）… \(fileSize / 1024)KB" }
-                    do {
-                        let mimeType = SunoAPI.shared.mimeTypeForAudioPublic(fileName)
-                        try await SunoAPI.shared.uploadFileToS3(
-                            presignedURL: uploadReq.url,
-                            fields: uploadReq.fields,
-                            fileData: audioData,
-                            fileName: fileName,
-                            mimeType: mimeType
-                        )
-                        DebugLog.shared.success("上传", "Step2 S3上传完成")
-                    } catch {
-                        DebugLog.shared.error("上传", "Step2 S3失败: \(error.localizedDescription)")
-                        throw SunoError.uploadFailed("Step2 S3上传失败: \(error.localizedDescription)")
-                    }
-
-                    // Step 3: 轮询处理状态
-                    await MainActor.run { message = "音频已上传，等待 Suno 处理（3/4）…" }
-                    var processingRounds = 0
-                    var uploadStatus: AudioUploadStatus
-                    repeat {
-                        try await Task.sleep(nanoseconds: 3_000_000_000)
-                        processingRounds += 1
-                        uploadStatus = try await SunoAPI.shared.pollUploadStatus(uploadId: uploadReq.id)
-                        await MainActor.run {
-                            message = "Suno 处理中（\(processingRounds * 3)s）…状态：\(uploadStatus.status ?? "unknown")"
-                        }
-                    } while uploadStatus.status == "processing" && processingRounds < 60
-
-                    // Step 4: 用上传的音频真正生成一首歌（否则只是 Suno 后台"上传素材"，不会出现在音乐库/网页端）
-                    await MainActor.run { message = "音频处理完成，正在生成歌曲（4/4）…" }
-                    let ext2 = (fileName as NSString).pathExtension.lowercased()
-                    let cdnUrl = uploadStatus.audio_url ?? "https://cdn1.suno.ai/\(uploadReq.id).\(ext2.isEmpty ? "mp3" : ext2)"
-                    var audioPayload = buildPayload()
-                    audioPayload.generation_type = "AUDIO"
-                    audioPayload.prompt = cdnUrl
-                    let stubs = try await SunoAPI.shared.generate(payload: audioPayload)
-                    let ids = stubs.map { $0.id }
-                    await MainActor.run { message = "已提交，Suno 创作中（\(ids.count) 首）…" }
-                    
-                    var finished = false
-                    var rounds = 0
-                    var consecutiveErrors = 0
-                    while !finished && rounds < 90 {
-                        try await Task.sleep(nanoseconds: 4_000_000_000)
-                        rounds += 1
-                        do {
-                            let clips = try await SunoAPI.shared.feed(ids: ids)
-                            consecutiveErrors = 0
-                            for c in clips {
-                                await MainActor.run { store.update(Song.from(clip: c)) }
-                            }
-                            finished = clips.allSatisfy { ($0.status ?? "streaming") == "complete" || ($0.status ?? "") == "error" }
-                        } catch {
-                            consecutiveErrors += 1
-                            guard consecutiveErrors >= 5 else {
-                                await MainActor.run { message = "轮询中…(\(rounds) \(consecutiveErrors)次暂失败，继续等待)" }
-                                continue
-                            }
-                            throw error
-                        }
-                        await MainActor.run { message = finished ? "✅ 创作完成！" : "创作中…(\(rounds)×4s)" }
-                    }
-                    
-                    await MainActor.run {
-                        busy = false
-                        message = finished ? "✅ 创作完成！已保存到音乐库，下拉刷新查看" : "仍在创作中，可到「音乐库」等待或下拉刷新"
-                        resetForm()
-                        NotificationCenter.default.post(name: Notification.Name("SunoReloadLibrary"), object: nil)
-                    }
-                    return
-                }
+                var stubs: [SunoClipStub]
 
                 // 正常生成流程（非音频上传）
                 stubs = try await SunoAPI.shared.generate(payload: buildPayload())
@@ -863,6 +790,232 @@ private struct SliderRow: View {
             if locked {
                 Text("免费版固定为 50%")
                     .font(.caption2).foregroundColor(AppTheme.textSecondary)
+            }
+        }
+    }
+}
+
+
+// MARK: - 上传音频信息载体
+struct UploadedAudioInfo {
+    let id: String
+    let url: String
+    let name: String
+}
+
+extension GenerateView {
+    /// 选中音频文件后自动上传到 Suno（S3 两步 + 轮询处理），
+    /// 上传成功后弹出翻唱页，用该音频作为风格参考生成新歌。
+    func autoUploadAudio(data: Data, localURL: URL, fileName: String) {
+        uploadingAudio = true
+        uploadMsg = "正在上传音频（1/3）…"
+        Task {
+            do {
+                let ext = (fileName as NSString).pathExtension.lowercased()
+                let uploadReq = try await SunoAPI.shared.requestAudioUpload(
+                    fileExtension: ext.isEmpty ? "mp3" : ext
+                )
+                await MainActor.run { uploadMsg = "上传到云端（2/3）… \(data.count / 1024)KB" }
+                let mime = SunoAPI.shared.mimeTypeForAudioPublic(fileName)
+                try await SunoAPI.shared.uploadFileToS3(
+                    presignedURL: uploadReq.url,
+                    fields: uploadReq.fields,
+                    fileData: data,
+                    fileName: fileName,
+                    mimeType: mime
+                )
+                await MainActor.run { uploadMsg = "等待 Suno 处理音频（3/3）…" }
+                var rounds = 0
+                var status: AudioUploadStatus
+                repeat {
+                    try await Task.sleep(nanoseconds: 3_000_000_000)
+                    rounds += 1
+                    status = try await SunoAPI.shared.pollUploadStatus(uploadId: uploadReq.id)
+                } while status.status == "processing" && rounds < 60
+                guard status.status == "complete" else {
+                    throw SunoError.uploadFailed("音频处理失败：status=\(status.status ?? "unknown")")
+                }
+                let cdn = status.audio_url ?? "https://cdn1.suno.ai/\(uploadReq.id).\(ext.isEmpty ? "mp3" : ext)"
+                await MainActor.run {
+                    uploadedAudio = UploadedAudioInfo(id: uploadReq.id, url: cdn, name: fileName)
+                    uploadingAudio = false
+                    showUploadedAudio = true
+                    pickedAudioData = nil
+                    pickedAudioURL = nil
+                    pickedAudioName = nil
+                }
+            } catch {
+                await MainActor.run {
+                    uploadingAudio = false
+                    uploadMsg = "❌ 上传失败：\(error.localizedDescription)"
+                    message = "❌ 上传失败：\(error.localizedDescription)"
+                    DebugLog.shared.error("上传", "自动上传失败: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+}
+
+// MARK: - 上传成功后的翻唱页（用该音频作为风格参考生成新歌）
+struct UploadedAudioView: View {
+    let info: UploadedAudioInfo
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var session = SunoSession.shared
+    @State private var prompt = ""
+    @State private var tags = ""
+    @State private var title = ""
+    @State private var model = SunoModels.defaultMV
+    @State private var instrumental = false
+    @State private var busy = false
+    @State private var message = ""
+
+    var body: some View {
+        AppNav {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label("已上传音频", systemImage: "waveform")
+                            .font(.headline).foregroundColor(AppTheme.accent)
+                        Text(info.name)
+                            .font(.subheadline).foregroundColor(AppTheme.textSecondary)
+                        Text("Suno 已将其作为风格参考。下方填写创作意图，生成与其音色 / 风格相近的新歌（非逐字翻唱）。")
+                            .font(.caption).foregroundColor(AppTheme.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(16)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(AppTheme.surface2)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+
+                    Button(action: { if let u = URL(string: info.url) { AudioPlayer.shared.toggle(url: u) } }) {
+                        Label("试听上传的音频", systemImage: "play.circle")
+                            .font(.subheadline)
+                    }
+                    .padding(.horizontal, 16)
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("创作意图（歌词或提示词，可留空让 Suno 自动生成）")
+                            .font(.subheadline).foregroundColor(AppTheme.textSecondary)
+                        TextEditor(text: $prompt)
+                            .frame(minHeight: 120)
+                            .padding(8)
+                            .background(AppTheme.surface2)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    .padding(.horizontal, 16)
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("风格标签（可选）").font(.subheadline).foregroundColor(AppTheme.textSecondary)
+                        TextField("如：lofi, 中文女声, 电子", text: $tags)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    .padding(.horizontal, 16)
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("标题（可选）").font(.subheadline).foregroundColor(AppTheme.textSecondary)
+                        TextField("留空则 Suno 自动命名", text: $title)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    .padding(.horizontal, 16)
+
+                    Toggle("纯音乐（无人声）", isOn: $instrumental)
+                        .padding(.horizontal, 16)
+
+                    if !message.isEmpty {
+                        Text(message).font(.footnote)
+                            .foregroundColor(message.contains("失败") ? AppTheme.error : AppTheme.textSecondary)
+                            .padding(.horizontal, 16)
+                    }
+
+                    Button(action: runRemix) {
+                        HStack {
+                            if busy { ProgressView().tint(.white) }
+                            Image(systemName: "wand.and.stars")
+                            Text(busy ? "生成中…" : "用这段音频翻唱")
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(busy ? AnyShapeStyle(AppTheme.surface2) : AnyShapeStyle(AppTheme.gradient()))
+                        .foregroundColor(.white)
+                        .font(.headline)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                    }
+                    .disabled(busy)
+                    .padding(.horizontal, 16)
+
+                    Spacer(minLength: 20)
+                }
+                .padding(.top, 12)
+            }
+            .hideScrollContentBackground()
+            .background(AppTheme.bg)
+            .navigationTitle("翻唱")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("关闭") { dismiss() }
+                }
+            }
+        }
+    }
+
+    func runRemix() {
+        guard session.isLoggedIn else {
+            message = "请先登录 Suno 账户"
+            return
+        }
+        busy = true
+        message = "正在以该音频为风格参考生成…"
+        Task {
+            do {
+                var p = GeneratePayload.custom(
+                    lyrics: prompt,
+                    tags: tags.isEmpty ? "" : tags,
+                    title: title.isEmpty ? "" : title,
+                    model: model,
+                    instrumental: instrumental
+                )
+                p.generation_type = "AUDIO"
+                p.audio_condition = AudioCondition(
+                    id: info.id,
+                    status: "complete",
+                    url: info.url,
+                    type: "audio"
+                )
+                p.audio_url = info.url
+                let stubs = try await SunoAPI.shared.generate(payload: p)
+                let ids = stubs.map { $0.id }
+                var finished = false
+                var rounds = 0
+                var consecutiveErrors = 0
+                while !finished && rounds < 90 {
+                    try await Task.sleep(nanoseconds: 4_000_000_000)
+                    rounds += 1
+                    do {
+                        let clips = try await SunoAPI.shared.feed(ids: ids)
+                        consecutiveErrors = 0
+                        for c in clips {
+                            await MainActor.run { SongStore.shared.update(Song.from(clip: c)) }
+                        }
+                        finished = clips.allSatisfy { ($0.status ?? "streaming") == "complete" || ($0.status ?? "") == "error" }
+                    } catch {
+                        consecutiveErrors += 1
+                        guard consecutiveErrors >= 5 else { continue }
+                        throw error
+                    }
+                    await MainActor.run { message = finished ? "✅ 完成！" : "生成中…(\(rounds)×4s)" }
+                }
+                await MainActor.run {
+                    busy = false
+                    message = "✅ 翻唱完成！已保存到音乐库"
+                    NotificationCenter.default.post(name: Notification.Name("SunoReloadLibrary"), object: nil)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { dismiss() }
+                }
+            } catch {
+                await MainActor.run {
+                    busy = false
+                    message = "❌ \(error.localizedDescription)"
+                }
             }
         }
     }
