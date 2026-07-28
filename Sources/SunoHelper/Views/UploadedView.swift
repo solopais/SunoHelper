@@ -6,6 +6,7 @@ import SwiftUI
 struct UploadedView: View {
     @StateObject private var store = UploadedSoundStore.shared
     @State private var playMsg: [String: String] = [:]
+    @State private var refreshingIDs: Set<String> = []
 
     private static let fmt: DateFormatter = {
         let f = DateFormatter()
@@ -67,13 +68,22 @@ struct UploadedView: View {
                 Spacer(minLength: 0)
             }
 
-            Button(action: {
-                // 播放 Suno 已处理后的版本（CDN）—— 用户要确认的是「Suno 那边收到的是什么」
-                AudioPlayer.shared.toggle(url: item.url)
-                playMsg[item.id] = "▶ 正在播放（Suno 处理版）"
-            }) {
-                Label("播放", systemImage: "play.circle")
-                    .font(.subheadline)
+            if !item.url.isEmpty {
+                Button(action: {
+                    AudioPlayer.shared.toggle(url: item.url)
+                    playMsg[item.id] = "▶ 正在播放（Suno 已处理版）"
+                }) {
+                    Label("播放", systemImage: "play.circle")
+                        .font(.subheadline)
+                }
+            } else if refreshingIDs.contains(item.id) {
+                ProgressView().tint(AppTheme.accent)
+            } else {
+                Button(action: { Task { await refreshURL(item) } }) {
+                    Label("刷新播放地址", systemImage: "arrow.clockwise")
+                        .font(.subheadline)
+                }
+                .foregroundColor(AppTheme.accent)
             }
             if let msg = playMsg[item.id], !msg.isEmpty {
                 Text(msg).font(.caption2).foregroundColor(AppTheme.accent)
@@ -82,9 +92,18 @@ struct UploadedView: View {
             Divider().background(AppTheme.surface2)
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("Suno 上传 ID（创作时的风格参考引用）")
+                Text("Suno 上传素材 ID（创作时 audio_condition 引用）")
                     .font(.caption2).foregroundColor(AppTheme.textSecondary)
                 Text(item.id)
+                    .font(.caption2.monospaced())
+                    .foregroundColor(AppTheme.textSecondary)
+                    .textSelection(.enabled)
+                    .lineLimit(1)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Suno 歌曲 ID（clipId，可在音乐库搜到这首上传曲）")
+                    .font(.caption2).foregroundColor(AppTheme.textSecondary)
+                Text(item.clipId)
                     .font(.caption2.monospaced())
                     .foregroundColor(AppTheme.textSecondary)
                     .textSelection(.enabled)
@@ -99,5 +118,19 @@ struct UploadedView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(AppTheme.surface2)
         .clipShape(RoundedRectangle(cornerRadius: 14))
+    }
+
+    /// 用 clipId 通过 feed/v3 重新取真实播放地址（上传时 feed 暂未就绪导致 url 为空时补救）
+    private func refreshURL(_ item: UploadedSound) async {
+        refreshingIDs.insert(item.id)
+        playMsg[item.id] = nil
+        defer { refreshingIDs.remove(item.id) }
+        do {
+            let url = try await SunoAPI.shared.fetchClipAudioURL(clipId: item.clipId)
+            UploadedSoundStore.shared.updateURL(id: item.id, url: url)
+            playMsg[item.id] = "✅ 已取到播放地址"
+        } catch {
+            playMsg[item.id] = "⚠️ 仍未取到：\(error.localizedDescription)"
+        }
     }
 }

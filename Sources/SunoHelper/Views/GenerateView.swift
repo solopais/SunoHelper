@@ -799,11 +799,12 @@ private struct SliderRow: View {
 
 // MARK: - 上传音频信息载体
 struct UploadedAudioInfo {
-    let id: String
-    let url: String        // Suno 处理后的 CDN 地址（可能不可用，仅作 generate 引用）
+    let id: String          // Suno 上传素材 ID（AUDIO 生成时 audio_condition 引用它）
+    let clipId: String      // Suno 歌曲/clip ID（由 initialize-clip 得到）
+    let url: String         // 真实可播放的 Suno CDN 地址（由 feed/v3 取得；空则用 localData 兜底）
     let name: String
-    let localData: Data?   // 原始音频文件数据（用于试听，立即可用、确定有声音）
-    let note: String?      // 非阻塞提示（如超时兜底/404 兜底）
+    let localData: Data?    // 原始音频文件数据（url 暂不可用时兜底试听）
+    let note: String?       // 非阻塞提示
 }
 
 /// 上传轮询结果：成功(可兜底超时) / 需整段重传
@@ -813,102 +814,59 @@ enum UploadOutcome {
 }
 
 extension GenerateView {
-    /// 选中音频文件后自动上传到 Suno（S3 两步 + 轮询处理），
-    /// 上传成功后弹出翻唱页，用该音频作为风格参考生成新歌。
+    /// 选中音频文件后自动上传到 Suno，并按 SunoTools 真实逻辑完成「注册为可播放 clip」，
+    /// 取得**真实可播放地址**后弹出翻唱页。整条链路：
+    ///   init(studio_file_upload) → S3 → upload-finish → 轮询 complete → initialize-clip → feed/v3 取 audio_url
     func autoUploadAudio(data: Data, localURL: URL, fileName: String) {
         uploadingAudio = true
-        uploadMsg = "正在上传音频（1/3）…"
+        uploadMsg = "正在上传音频…"
         Task {
-        do {
-            let ext = (fileName as NSString).pathExtension.lowercased()
-            let maxAttempts = 3            // 整段重传次数（处理偶发瞬时失败）
-            var lastErr: Error?
-            var committed: (id: String, url: String)?
-            uploadLoop: for attempt in 1...maxAttempts {
-                do {
-                    let uploadReq = try await SunoAPI.shared.requestAudioUpload(
-                        fileExtension: ext.isEmpty ? "mp3" : ext
-                    )
-                    await MainActor.run { uploadMsg = "上传到云端（2/3）… \(data.count / 1024)KB" }
-                    let mime = SunoAPI.shared.mimeTypeForAudioPublic(fileName)
-                    try await SunoAPI.shared.uploadFileToS3(
-                        presignedURL: uploadReq.url,
-                        fields: uploadReq.fields,
-                        fileData: data,
-                        fileName: fileName,
-                        mimeType: mime
-                    )
-                    // Step 2.5: 通知 Suno 开始处理（幂等安全：id 已存在视为成功，绝不会重复触发 status=error）
-                    await MainActor.run { uploadMsg = "通知 Suno 开始处理（2.5/3）…" }
-                    try await SunoAPI.shared.confirmUploadFinish(uploadId: uploadReq.id, fileName: fileName)
-                    committed = (uploadReq.id, "https://cdn1.suno.ai/\(uploadReq.id).\(ext.isEmpty ? "mp3" : ext)")
-                    break uploadLoop
-                } catch {
-                    lastErr = error
-                    await MainActor.run { uploadMsg = "上传出错，正在重试（\(attempt)/\(maxAttempts)）…" }
-                    continue uploadLoop
-                }
-            }
-            guard let c = committed else {
-                throw lastErr ?? SunoError.uploadFailed("上传失败")
-            }
-
-            // ✅ 上传已在 Suno 注册完成：立即展示翻唱页（不再阻塞等待 10 分钟处理）
-            // 同时持久化到「已上传」列表，让用户明确看到自己传过的歌
-            UploadedSoundStore.shared.add(id: c.id, name: fileName, url: c.url, data: data)
-            let info = UploadedAudioInfo(
-                id: c.id, url: c.url,
-                name: fileName,
-                localData: data,   // 原始音频数据，试听确定有声音
-                note: "Suno 已在后台开始处理此音频，可直接翻唱（若提示音频未就绪，稍候片刻重试即可）"
-            )
-            await MainActor.run {
-                uploadedAudio = info
-                uploadingAudio = false
-                showUploadedAudio = true
-                audioProcessingDone = false
-                pickedAudioData = nil
-                pickedAudioURL = nil
-                pickedAudioName = nil
-            }
-            // 后台轮询：音频处理完成后才启用「翻唱」按钮（不阻塞 UI）
-            Task { await pollUntilReady(uploadId: c.id) }
-        } catch {
-            await MainActor.run {
-                uploadingAudio = false
-                uploadMsg = "❌ 上传失败：\(error.localizedDescription)"
-                message = "❌ 上传失败：\(error.localizedDescription)"
-                DebugLog.shared.error("上传", "自动上传失败: \(error.localizedDescription)")
-            }
-        }
-        }
-    }
-
-    /// 后台轮询上传音频处理状态：complete / passed_audio_processing / 404(资源已清理) 即视为就绪，启用翻唱按钮。
-    /// 仅轮询、不阻塞 UI。超时兜底也启用，避免按钮永久禁用。
-    private func pollUntilReady(uploadId: String) async {
-        var rounds = 0
-        let maxRounds = 120            // 120 × 3s ≈ 6 分钟
-        while rounds < maxRounds {
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
-            rounds += 1
             do {
-                let st = try await SunoAPI.shared.pollUploadStatus(uploadId: uploadId)
-                let s = st.status
-                if s == "complete" || s == "passed_audio_processing" {
-                    await MainActor.run { audioProcessingDone = true }
-                    return
+                let result = try await SunoAPI.shared.uploadAndGetPlayableURL(
+                    fileData: data, fileName: fileName
+                ) { [weak self] msg in
+                    Task { @MainActor in self?.uploadMsg = msg }
                 }
-                // processing / uploaded / pending / queued / 未知 → 继续等
-            } catch let SunoError.http(code, _) where code == 404 {
-                // 404 = Suno 已处理完并清理资源 → 就绪
-                await MainActor.run { audioProcessingDone = true }
-                return
+
+                // 持久化到「已上传」列表（存**真实**可播放地址 + clipId）
+                UploadedSoundStore.shared.add(
+                    id: result.uploadId, clipId: result.clipId,
+                    name: fileName, url: result.audioUrl, data: data
+                )
+
+                let note: String
+                if result.audioUrl.isEmpty {
+                    note = "Suno 已接收并处理音频，但可播放地址暂未就绪（罕见）。翻唱不受影响；在「已上传」里点「刷新地址」即可取回。"
+                } else {
+                    note = "Suno 已将其作为风格参考，并生成了可播放版本。"
+                }
+
+                let info = UploadedAudioInfo(
+                    id: result.uploadId,
+                    clipId: result.clipId,
+                    url: result.audioUrl,
+                    name: fileName,
+                    localData: data,   // url 暂不可用时兜底试听
+                    note: note
+                )
+                await MainActor.run {
+                    uploadedAudio = info
+                    uploadingAudio = false
+                    showUploadedAudio = true
+                    audioProcessingDone = true   // 完整流程已含处理+注册，直接可翻唱
+                    pickedAudioData = nil
+                    pickedAudioURL = nil
+                    pickedAudioName = nil
+                }
             } catch {
-                // 瞬时错误继续等
+                await MainActor.run {
+                    uploadingAudio = false
+                    uploadMsg = "❌ 上传失败：\(error.localizedDescription)"
+                    message = "❌ 上传失败：\(error.localizedDescription)"
+                    DebugLog.shared.error("上传", "自动上传失败: \(error.localizedDescription)")
+                }
             }
         }
-        await MainActor.run { audioProcessingDone = true }   // 兜底启用
     }
 }
 
@@ -954,9 +912,16 @@ struct UploadedAudioView: View {
                     }
 
                     Button(action: {
-                        // 播放 Suno 已处理后的版本（CDN）—— 用户要听的是上传到 Suno 后的音频
-                        AudioPlayer.shared.toggle(url: info.url)
-                        playMsg = "▶ 正在播放（Suno 处理版）"
+                        // 优先播 Suno 真实处理版（真实 audio_url）；地址暂未就绪则兜底播本地原文件
+                        if !info.url.isEmpty {
+                            AudioPlayer.shared.toggle(url: info.url)
+                            playMsg = "▶ 正在播放（Suno 处理版）"
+                        } else if let d = info.localData {
+                            AudioPlayer.shared.playFromData(d, fileName: info.name)
+                            playMsg = "▶ 正在播放（本地原文件，Suno 地址暂未就绪）"
+                        } else {
+                            playMsg = "⚠️ 暂无可播放音频"
+                        }
                     }) {
                         Label("试听上传的音频", systemImage: "play.circle")
                             .font(.subheadline)

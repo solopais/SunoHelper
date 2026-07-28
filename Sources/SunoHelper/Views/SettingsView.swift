@@ -90,6 +90,42 @@ struct SettingsView: View {
                 }
                 .listRowBackground(AppTheme.surface)
 
+                // MARK: - 授权与发行（预留，跑通后再接入）
+                Section("授权与发行（即将上线）") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "key.fill")
+                                .foregroundColor(AppTheme.accent)
+                            Text("授权管理")
+                                .font(.subheadline).bold()
+                                .foregroundColor(AppTheme.text)
+                            Spacer()
+                            Text("预留")
+                                .font(.caption2)
+                                .padding(.horizontal, 8).padding(.vertical, 3)
+                                .background(AppTheme.surface2)
+                                .foregroundColor(AppTheme.textSecondary)
+                                .clipShape(Capsule())
+                        }
+                        Text("用于后续发行版本的激活码校验与设备绑定。当前为占位，跑通核心功能后再接入授权逻辑。")
+                            .font(.caption2)
+                            .foregroundColor(AppTheme.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        // 激活码输入框（占位，暂未启用）
+                        HStack {
+                            TextField("激活码（暂未启用）", text: .constant(""))
+                                .textFieldStyle(.roundedBorder)
+                                .disabled(true)
+                            Button(action: {}) {
+                                Text("激活")
+                            }
+                            .disabled(true)
+                            .foregroundColor(AppTheme.textSecondary)
+                        }
+                    }
+                }
+                .listRowBackground(AppTheme.surface)
+
                 Section("数据") {
                     HStack {
                         Text("音乐库数量")
@@ -147,7 +183,7 @@ struct SettingsView: View {
             .listStyle(.insetGrouped)
             .hideScrollContentBackground()
             .background(AppTheme.bg)
-            .navigationTitle("我的")
+            .navigationTitle("个人中心")
             .navigationBarTitleDisplayMode(.inline)
             .alert("清空音乐库", isPresented: $showClear) {
                 Button("取消", role: .cancel) {}

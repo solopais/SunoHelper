@@ -22,11 +22,11 @@ struct MainTabView: View {
             GenerateView()
                 .tabItem { Label("创作", systemImage: "music.note") }
 
-            UploadedView()
-                .tabItem { Label("已上传", systemImage: "tray.and.arrow.up") }
-
             LibraryView()
                 .tabItem { Label("音乐库", systemImage: "music.note.list") }
+
+            UploadedView()
+                .tabItem { Label("上传", systemImage: "tray.and.arrow.up") }
 
             SettingsView()
                 .tabItem { Label("我的", systemImage: "person.circle") }
