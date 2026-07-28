@@ -855,7 +855,7 @@ extension GenerateView {
 
             // ✅ 上传已在 Suno 注册完成：立即展示翻唱页（不再阻塞等待 10 分钟处理）
             // 同时持久化到「已上传」列表，让用户明确看到自己传过的歌
-            UploadedSoundStore.shared.add(id: c.id, name: fileName, data: data)
+            UploadedSoundStore.shared.add(id: c.id, name: fileName, url: c.url, data: data)
             let info = UploadedAudioInfo(
                 id: c.id, url: c.url,
                 name: fileName,

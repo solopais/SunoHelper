@@ -8,6 +8,7 @@ struct UploadedSound: Identifiable, Codable {
     let id: String          // Suno 上传 ID（即 audio_condition 引用的素材 ID）
     let name: String        // 原始文件名
     let fileName: String    // 本地保存的文件名（Documents/Uploads/ 下）
+    let url: String         // Suno CDN 地址（处理后的音频）
     let date: Date
 }
 
@@ -37,12 +38,12 @@ final class UploadedSoundStore: ObservableObject {
     }
 
     /// 保存一次上传：写文件到 Documents/Uploads/ 并追加到列表（按 id 去重）
-    func add(id: String, name: String, data: Data) {
+    func add(id: String, name: String, url: String, data: Data) {
         let ext = (name as NSString).pathExtension.lowercased().isEmpty ? "mp3" : (name as NSString).pathExtension.lowercased()
         let fname = "\(id).\(ext)"
         let url = dir.appendingPathComponent(fname)
         try? data.write(to: url)
-        let item = UploadedSound(id: id, name: name, fileName: fname, date: Date())
+        let item = UploadedSound(id: id, name: name, fileName: fname, url: url, date: Date())
         DispatchQueue.main.async {
             if !self.items.contains(where: { $0.id == id }) {
                 self.items.insert(item, at: 0)
