@@ -184,6 +184,29 @@ struct SunoAPI {
         }
     }
 
+    /// Step 2.5: 报告上传完毕（通知 Suno 服务器 S3 文件已上传完成，开始处理音频）
+    /// ⚠️ 缺少此步骤会导致轮询永远 processing（服务器不知道文件已就绪）
+    /// 对应网页端流程第 3 步：POST /api/uploads/audio/{id}/upload-finish
+    func confirmUploadFinish(uploadId: String, fileName: String) async throws {
+        try await run {
+            let url = URL(string: "\(SunoAPI.base)/api/uploads/audio/\(uploadId)/upload-finish")!
+            var req = makeRequest(url, method: "POST")
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            let body = try JSONEncoder().encode([
+                "upload_type": "file_upload",
+                "upload_filename": fileName
+            ])
+            req.httpBody = body
+            DebugLog.shared.info("上传", "Step2.5 POST /upload-finish id=\(uploadId.prefix(8)) file=\(fileName)")
+            let (data, resp) = try await Self.performDataRequest(req)
+            if let http = resp as? HTTPURLResponse {
+                DebugLog.shared.info("上传", "upload-finish 响应: \(http.statusCode)")
+            }
+            try Self.check(resp: resp, data: data)
+            DebugLog.shared.success("上传", "upload-finish 成功（Suno 开始处理音频）")
+        }
+    }
+
         /// 音频上传完整流程（Step 1 + Step 2），返回上传结果供后续 generate/cover 使用
     /// 这是新入口：替代旧的直接 multipart 到 generate 的错误方式
     func uploadAudioOnly(fileData: Data, fileName: String) async throws -> AudioUploadResult {

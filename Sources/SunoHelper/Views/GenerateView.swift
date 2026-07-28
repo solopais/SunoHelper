@@ -826,8 +826,12 @@ extension GenerateView {
                     fileName: fileName,
                     mimeType: mime
                 )
-                // Step 3: 轮询 Suno 后端处理音频。免费版负载高时可能超过 3 分钟，
-                // 故把窗口拉到 200 轮（≈10 分钟）并实时显示进度。
+                // Step 2.5: 通知 Suno 服务器文件已上传完成（触发处理）
+                // ⚠️ 缺此步骤 → 服务器不知道 S3 上传完毕 → 轮询永远 processing
+                await MainActor.run { uploadMsg = "通知 Suno 开始处理（2.5/3）…" }
+                try await SunoAPI.shared.confirmUploadFinish(uploadId: uploadReq.id, fileName: fileName)
+                // Step 3: 轮询 Suno 后端处理音频。调了 upload-finish 后通常 1-2 分钟即 complete，
+                // 保留 200 轮窗口兜底极端慢的情况。
                 await MainActor.run { uploadMsg = "Suno 正在处理音频（3/3），请稍候…" }
                 var rounds = 0
                 let maxRounds = 200            // 200 × 3s ≈ 10 分钟
