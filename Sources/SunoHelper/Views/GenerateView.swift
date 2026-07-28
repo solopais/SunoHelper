@@ -801,6 +801,7 @@ struct UploadedAudioInfo {
     let id: String
     let url: String
     let name: String
+    let note: String?   // 非阻塞提示（如超时兜底）
 }
 
 extension GenerateView {
@@ -824,20 +825,33 @@ extension GenerateView {
                     fileName: fileName,
                     mimeType: mime
                 )
-                await MainActor.run { uploadMsg = "等待 Suno 处理音频（3/3）…" }
+                // Step 3: 轮询 Suno 后端处理音频。免费版负载高时可能超过 3 分钟，
+                // 故把窗口拉到 200 轮（≈10 分钟）并实时显示进度。
+                await MainActor.run { uploadMsg = "Suno 正在处理音频（3/3），请稍候…" }
                 var rounds = 0
-                var status: AudioUploadStatus
-                repeat {
+                let maxRounds = 200            // 200 × 3s ≈ 10 分钟
+                var status: AudioUploadStatus?
+                while rounds < maxRounds {
                     try await Task.sleep(nanoseconds: 3_000_000_000)
                     rounds += 1
                     status = try await SunoAPI.shared.pollUploadStatus(uploadId: uploadReq.id)
-                } while status.status == "processing" && rounds < 60
-                guard status.status == "complete" else {
-                    throw SunoError.uploadFailed("音频处理失败：status=\(status.status ?? "unknown")")
+                    await MainActor.run { uploadMsg = "Suno 处理音频中（\(rounds)/\(maxRounds)）…" }
+                    if status?.status != "processing" { break }
                 }
-                let cdn = status.audio_url ?? "https://cdn1.suno.ai/\(uploadReq.id).\(ext.isEmpty ? "mp3" : ext)"
+                let finalStatus = status?.status ?? "processing"
+                guard finalStatus != "error" else {
+                    throw SunoError.uploadFailed("音频处理失败：status=error")
+                }
+                // 超时仍未 complete：不丢弃上传，用 id 拼出 CDN 地址兜底继续翻唱
+                // （Suno 通常仍在后台处理该资源，generate 引用 id 即可）
+                let cdn = status?.audio_url
+                    ?? "https://cdn1.suno.ai/\(uploadReq.id).\(ext.isEmpty ? "mp3" : ext)"
+                let timedOut = (finalStatus == "processing")
                 await MainActor.run {
-                    uploadedAudio = UploadedAudioInfo(id: uploadReq.id, url: cdn, name: fileName)
+                    uploadedAudio = UploadedAudioInfo(
+                        id: uploadReq.id, url: cdn, name: fileName,
+                        note: timedOut ? "⏳ 音频仍在处理中，已用上传地址兜底，可直接翻唱（若失败稍后重试）" : nil
+                    )
                     uploadingAudio = false
                     showUploadedAudio = true
                     pickedAudioData = nil
@@ -886,6 +900,14 @@ struct UploadedAudioView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(AppTheme.surface2)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
+
+                    if let note = info.note, !note.isEmpty {
+                        Text(note)
+                            .font(.caption)
+                            .foregroundColor(AppTheme.accent)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.horizontal, 16)
+                    }
 
                     Button(action: { AudioPlayer.shared.toggle(url: info.url) }) {
                         Label("试听上传的音频", systemImage: "play.circle")

@@ -228,7 +228,7 @@ struct SunoAPI {
 
         // Step 3: 轮询处理状态（每 3 秒查一次，最长 3 分钟）
         var rounds = 0
-        let maxRounds = 60  // 60 × 3s = 180s = 3 分钟
+        let maxRounds = 200  // 200 × 3s ≈ 10 分钟（免费版负载高时处理可能超过 3 分钟）
         while rounds < maxRounds {
             try await Task.sleep(nanoseconds: 3_000_000_000)
             rounds += 1
