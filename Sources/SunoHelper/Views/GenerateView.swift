@@ -799,9 +799,10 @@ private struct SliderRow: View {
 // MARK: - 上传音频信息载体
 struct UploadedAudioInfo {
     let id: String
-    let url: String
+    let url: String        // CDN 地址（可能延迟可用）
+    let localURL: String?  // 本地文件路径（试听优先用，立即可用）
     let name: String
-    let note: String?   // 非阻塞提示（如超时兜底）
+    let note: String?      // 非阻塞提示（如超时兜底/404 兜底）
 }
 
 extension GenerateView {
@@ -863,7 +864,9 @@ extension GenerateView {
                 let timedOut = (finalStatus == "processing")
                 await MainActor.run {
                     uploadedAudio = UploadedAudioInfo(
-                        id: uploadReq.id, url: cdn, name: fileName,
+                        id: uploadReq.id, url: cdn,
+                        localURL: pickedAudioURL?.path,
+                        name: fileName,
                         note: timedOut ? "⏳ 音频仍在处理中，已用上传地址兜底，可直接翻唱（若失败稍后重试）"
                                 : (pollErrored404 ? "✅ Suno 已处理完音频（轮询返回 404 视为完成），可直接翻唱" : nil)
                     )
@@ -897,6 +900,7 @@ struct UploadedAudioView: View {
     @State private var instrumental = false
     @State private var busy = false
     @State private var message = ""
+    @State private var playMsg = ""   // 试听状态提示
 
     var body: some View {
         AppNav {
@@ -924,14 +928,22 @@ struct UploadedAudioView: View {
                             .padding(.horizontal, 16)
                     }
 
-                    Button(action: { AudioPlayer.shared.toggle(url: info.url) }) {
+                    Button(action: {
+                        // 优先用本地文件（立即可用），fallback 到 CDN
+                        let playURL = info.localURL ?? info.url
+                        AudioPlayer.shared.toggle(url: playURL)
+                        playMsg = info.localURL != nil ? "▶ 正在播放本地文件" : "▶ 正在播放（CDN 加载中…）"
+                    }) {
                         Label("试听上传的音频", systemImage: "play.circle")
                             .font(.subheadline)
                     }
                     .padding(.horizontal, 16)
+                    if !playMsg.isEmpty {
+                        Text(playMsg).font(.caption2).foregroundColor(AppTheme.accent).padding(.horizontal, 16)
+                    }
 
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("创作意图（歌词或提示词，可留空让 Suno 自动生成）")
+                        Text("风格提示词（描述你想要的氛围/感觉，留空则 Suno 仅依据音频风格生成；**不要填歌词**，Suno 会自动生成歌词）")
                             .font(.subheadline).foregroundColor(AppTheme.textSecondary)
                         TextEditor(text: $prompt)
                             .frame(minHeight: 120)
@@ -1005,14 +1017,17 @@ struct UploadedAudioView: View {
         message = "正在以该音频为风格参考生成…"
         Task {
             do {
-                var p = GeneratePayload.custom(
-                    lyrics: prompt,
-                    tags: tags.isEmpty ? "" : tags,
-                    title: title.isEmpty ? "" : title,
-                    model: model,
-                    instrumental: instrumental
+                // 关键修复：AUDIO 模式下，用户输入是「风格提示词」不是歌词
+                // prompt="" 让 Suno 自动生成歌词；用户的描述走 gpt_description_prompt（风格提示词）
+                var p = GeneratePayload(
+                    make_instrumental: instrumental,
+                    mv: model,
+                    prompt: "",   // 不指定歌词 → Suno 自动生成（之前错误地把用户输入当歌词塞这里）
+                    tags: tags.isEmpty ? nil : tags,
+                    title: title.isEmpty ? nil : title
                 )
                 p.generation_type = "AUDIO"
+                p.gpt_description_prompt = prompt.isEmpty ? nil : prompt  // 风格提示词
                 p.audio_condition = AudioCondition(
                     id: info.id,
                     status: "complete",
