@@ -87,7 +87,41 @@ struct SunoAPI {
         }
     }
 
-    // MARK: - 音频上传（S3 两步流程）
+    
+    /// 网络请求重试封装：对"请求未到达服务器"的瞬时连接错误自动重试，
+    /// 吞掉偶发 -1005 / 断网抖动，避免一次网络闪断就整条上传/生成失败。
+    /// 仅重试连接级错误（连接丢失/无法连接，服务端不可能已处理请求），
+    /// 不重试超时(-1001)/取消(-999)/4xx/5xx（避免 POST 重复提交产生重复歌曲）。
+    private static func performDataRequest(_ req: URLRequest) async throws -> (Data, URLResponse) {
+        let maxAttempts = 3
+        let retryable: [URLError.Code] = [
+            .networkConnectionLost,   // -1005
+            .cannotConnectToHost,     // -1004
+            .cannotFindHost,          // -1003
+            .notConnectedToInternet,  // -1009
+            .cannotLoadFromNetwork    // -1020
+        ]
+        var lastError: Error?
+        for attempt in 1...maxAttempts {
+            do {
+                return try await URLSession.shared.data(for: req)
+            } catch {
+                if attempt < maxAttempts,
+                   let urlErr = error as? URLError,
+                   retryable.contains(urlErr.code) {
+                    DebugLog.shared.info("网络", "瞬时连接错误[\(urlErr.errorCode)] 第\(attempt)次，重试...")
+                    let backoff = attempt == 1 ? 1_000_000_000 : 2_000_000_000
+                    try? await Task.sleep(nanoseconds: backoff)
+                    lastError = error
+                    continue
+                }
+                throw error
+            }
+        }
+        throw lastError ?? SunoError.network(NSError(domain: "suno.retry", code: -1))
+    }
+
+// MARK: - 音频上传（S3 两步流程）
     //
     // Suno 真实音频上传流程（从网页版逆向确认）：
     //   Step 1: POST /api/uploads/audio { extension: "mp3" } → 获取 S3 预签名 URL + 表单字段
@@ -113,7 +147,7 @@ struct SunoAPI {
             req.timeoutInterval = 30
 
             DebugLog.shared.info("上传", "Step1 POST /api/uploads/audio/ ext=\(fileExtension)")
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await Self.performDataRequest(req)
             if let http = resp as? HTTPURLResponse {
                 DebugLog.shared.info("上传", "Step1 响应: \(http.statusCode)")
             }
@@ -180,7 +214,7 @@ struct SunoAPI {
         try await run {
             let url = URL(string: "\(SunoAPI.base)/api/uploads/audio/\(uploadId)/")!
             let req = makeRequest(url)
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await Self.performDataRequest(req)
             try Self.check(resp: resp, data: data)
             return try JSONDecoder().decode(AudioUploadStatus.self, from: data)
         }
@@ -269,7 +303,7 @@ struct SunoAPI {
             let body = try JSONEncoder().encode(payload)
             let req = makeRequest(url, method: "POST", body: body)
             DebugLog.shared.info("生成", "POST /api/generate/v2/ task=\(payload.task ?? "?") mv=\(payload.mv)")
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await Self.performDataRequest(req)
             if let http = resp as? HTTPURLResponse {
                 DebugLog.shared.info("生成", "响应: \(http.statusCode)")
             }
@@ -286,7 +320,7 @@ struct SunoAPI {
             var comps = URLComponents(string: "\(SunoAPI.base)/api/feed/v2")!
             comps.queryItems = [URLQueryItem(name: "ids", value: ids.joined(separator: ","))]
             let req = makeRequest(comps.url!)
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await Self.performDataRequest(req)
             try Self.check(resp: resp, data: data)
             return Self.decodeClips(data)
         }
@@ -320,7 +354,7 @@ struct SunoAPI {
             let urlStr = comps.url!.absoluteString
             let shortUrl = String(urlStr.suffix(80))
             DebugLog.shared.info("音乐库", "GET .../\(shortUrl)")
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await Self.performDataRequest(req)
             if let http = resp as? HTTPURLResponse {
                 DebugLog.shared.info("音乐库", "page=\(safePage) 响应: \(http.statusCode) \(data.count)B")
             }
@@ -340,7 +374,7 @@ struct SunoAPI {
         try await run {
             let url = URL(string: "\(SunoAPI.base)/api/billing/info/")!
             let req = makeRequest(url)
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await Self.performDataRequest(req)
             try Self.check(resp: resp, data: data)
             let b = try JSONDecoder().decode(BillingInfo.self, from: data)
             return b.total_credits_left ?? 0
@@ -352,7 +386,7 @@ struct SunoAPI {
         try await run {
             let url = URL(string: "\(SunoAPI.base)/api/billing/info/")!
             let req = makeRequest(url)
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await Self.performDataRequest(req)
             try Self.check(resp: resp, data: data)
             return try JSONDecoder().decode(BillingInfo.self, from: data)
         }
