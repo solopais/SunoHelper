@@ -887,7 +887,7 @@ struct UploadedAudioView: View {
                     .background(AppTheme.surface2)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
 
-                    Button(action: { if let u = URL(string: info.url) { AudioPlayer.shared.toggle(url: u) } }) {
+                    Button(action: { AudioPlayer.shared.toggle(url: info.url) }) {
                         Label("试听上传的音频", systemImage: "play.circle")
                             .font(.subheadline)
                     }
