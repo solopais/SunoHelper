@@ -824,9 +824,7 @@ extension GenerateView {
             do {
                 let result = try await SunoAPI.shared.uploadAndGetPlayableURL(
                     fileData: data, fileName: fileName
-                ) { [weak self] msg in
-                    Task { @MainActor in self?.uploadMsg = msg }
-                }
+                )
 
                 // 持久化到「已上传」列表（存**真实**可播放地址 + clipId）
                 UploadedSoundStore.shared.add(

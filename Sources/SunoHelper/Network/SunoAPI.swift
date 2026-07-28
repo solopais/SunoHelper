@@ -51,7 +51,7 @@ struct AudioUploadStatus: Decodable {
     let status: String?          // "processing" → "complete" / "error"
     let title: String?
     let audio_url: String?       // 处理完成后可能返回真实 CDN URL（部分接口直接给）
-    let s3_id: String?           // 处理完成后 Suno 分配的 clip/s3 id（initialize-clip 的上游）
+    let s3_id: String? = nil     // 处理完成后 Suno 分配的 clip/s3 id（initialize-clip 的上游）
     let copyright_muted: Bool?
 }
 
@@ -327,9 +327,9 @@ struct SunoAPI {
             let (data, resp) = try await Self.performDataRequest(req)
             try Self.check(resp: resp, data: data)
             let wrapped = try? JSONDecoder().decode(SunoFeedResponse.self, from: data)
-            let url = wrapped?.clips.first?.audio_url
-            DebugLog.shared.success("上传", "feed/v3 取到 audio_url=\(url?.prefix(40) ?? "<空>")")
-            guard let u = url, !u.isEmpty else {
+            let audioURL = wrapped?.clips.first?.audio_url
+            DebugLog.shared.success("上传", "feed/v3 取到 audio_url=\(audioURL?.prefix(40) ?? "<空>")")
+            guard let u = audioURL, !u.isEmpty else {
                 throw SunoError.uploadFailed("feed/v3 未返回 audio_url")
             }
             return u
