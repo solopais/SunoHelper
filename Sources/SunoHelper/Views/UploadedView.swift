@@ -120,17 +120,18 @@ struct UploadedView: View {
         .clipShape(RoundedRectangle(cornerRadius: 14))
     }
 
-    /// 用 clipId 通过 feed/v3 重新取真实播放地址（上传时 feed 暂未就绪导致 url 为空时补救）
+    /// 用 uploadId 重新走 initialize-clip → feed/v3 取真实播放地址
+    ///（clipId 为空也能补救：会先尝试 initialize-clip 拿 clipId）
     private func refreshURL(_ item: UploadedSound) async {
         refreshingIDs.insert(item.id)
         playMsg[item.id] = nil
         defer { refreshingIDs.remove(item.id) }
-        do {
-            let url = try await SunoAPI.shared.fetchClipAudioURL(clipId: item.clipId)
-            UploadedSoundStore.shared.updateURL(id: item.id, url: url)
+        let result = await SunoAPI.shared.fetchPlayableURLByUploadId(uploadId: item.id)
+        UploadedSoundStore.shared.update(id: item.id, clipId: result.clipId, url: result.audioUrl)
+        if !result.audioUrl.isEmpty {
             playMsg[item.id] = "✅ 已取到播放地址"
-        } catch {
-            playMsg[item.id] = "⚠️ 仍未取到：\(error.localizedDescription)"
+        } else {
+            playMsg[item.id] = "⚠️ 仍未取到（可能 Suno 仍在处理，稍后再试）"
         }
     }
 }

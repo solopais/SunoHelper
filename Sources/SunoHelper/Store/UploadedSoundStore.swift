@@ -64,6 +64,19 @@ final class UploadedSoundStore: ObservableObject {
         }
     }
 
+    /// 同时更新 clipId 与真实播放地址（后台解析完成时回填）
+    func update(id: String, clipId: String, url: String) {
+        DispatchQueue.main.async {
+            guard let idx = self.items.firstIndex(where: { $0.id == id }) else { return }
+            let old = self.items[idx]
+            self.items[idx] = UploadedSound(
+                id: old.id, clipId: clipId, name: old.name,
+                fileName: old.fileName, url: url, date: old.date
+            )
+            self.save()
+        }
+    }
+
     private func load() {
         guard let data = UserDefaults.standard.data(forKey: key),
               let arr = try? JSONDecoder().decode([UploadedSound].self, from: data) else { return }

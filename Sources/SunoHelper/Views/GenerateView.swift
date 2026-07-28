@@ -814,47 +814,50 @@ enum UploadOutcome {
 }
 
 extension GenerateView {
-    /// 选中音频文件后自动上传到 Suno，并按 SunoTools 真实逻辑完成「注册为可播放 clip」，
-    /// 取得**真实可播放地址**后弹出翻唱页。整条链路：
-    ///   init(studio_file_upload) → S3 → upload-finish → 轮询 complete → initialize-clip → feed/v3 取 audio_url
+    /// 选中音频后自动上传：Step1-3 注册（仅几秒）后**立即**弹窗，
+    /// 真实可播放地址在后台异步解析，就绪后回填——不再阻塞等 10+ 分钟，也不会因 404 崩溃。
     func autoUploadAudio(data: Data, localURL: URL, fileName: String) {
         uploadingAudio = true
         uploadMsg = "正在上传音频…"
         Task {
             do {
-                let result = try await SunoAPI.shared.uploadAndGetPlayableURL(
-                    fileData: data, fileName: fileName
-                )
+                // 1-3：注册上传（仅几秒，失败才抛错）
+                let uploadId = try await SunoAPI.shared.beginUpload(fileData: data, fileName: fileName)
 
-                // 持久化到「已上传」列表（存**真实**可播放地址 + clipId）
+                // 立即持久化 + 弹窗（url 暂空，后台解析）
                 UploadedSoundStore.shared.add(
-                    id: result.uploadId, clipId: result.clipId,
-                    name: fileName, url: result.audioUrl, data: data
+                    id: uploadId, clipId: "", name: fileName, url: "", data: data
                 )
-
-                let note: String
-                if result.audioUrl.isEmpty {
-                    note = "Suno 已接收并处理音频，但可播放地址暂未就绪（罕见）。翻唱不受影响；在「已上传」里点「刷新地址」即可取回。"
-                } else {
-                    note = "Suno 已将其作为风格参考，并生成了可播放版本。"
-                }
-
+                let note = "Suno 已接收音频，正在后台处理（免费队列较慢，通常几分钟）。可播放地址就绪后会自动填入；也可稍后在「已上传」点「刷新地址」。"
                 let info = UploadedAudioInfo(
-                    id: result.uploadId,
-                    clipId: result.clipId,
-                    url: result.audioUrl,
-                    name: fileName,
-                    localData: data,   // url 暂不可用时兜底试听
-                    note: note
+                    id: uploadId, clipId: "", url: "",
+                    name: fileName, localData: data, note: note
                 )
                 await MainActor.run {
                     uploadedAudio = info
                     uploadingAudio = false
                     showUploadedAudio = true
-                    audioProcessingDone = true   // 完整流程已含处理+注册，直接可翻唱
+                    // 翻唱用 uploadId 作风格参考，注册完成即可翻唱；真实播放地址后台异步回填
+                    audioProcessingDone = true
                     pickedAudioData = nil
                     pickedAudioURL = nil
                     pickedAudioName = nil
+                }
+
+                // 后台解析真实地址（绝不硬抛 404，返回部分结果）
+                let result = await SunoAPI.shared.resolveUploadedAudioURL(uploadId: uploadId, fileName: fileName)
+                UploadedSoundStore.shared.update(id: uploadId, clipId: result.clipId, url: result.audioUrl)
+                await MainActor.run {
+                    if uploadedAudio?.id == uploadId {
+                        uploadedAudio = UploadedAudioInfo(
+                            id: uploadId, clipId: result.clipId, url: result.audioUrl,
+                            name: fileName, localData: data,
+                            note: result.audioUrl.isEmpty
+                                ? "Suno 已注册该音频，但可播放地址暂未取到，可在「已上传」点「刷新地址」。"
+                                : "Suno 已生成可播放版本，可直接试听 / 翻唱。"
+                        )
+                    }
+                    audioProcessingDone = true
                 }
             } catch {
                 await MainActor.run {
