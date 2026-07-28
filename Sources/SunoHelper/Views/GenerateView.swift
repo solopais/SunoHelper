@@ -356,10 +356,44 @@ struct GenerateView: View {
                         }
                     } while uploadStatus.status == "processing" && processingRounds < 60
 
-                    // Step 4: 完成
+                    // Step 4: 用上传的音频真正生成一首歌（否则只是 Suno 后台"上传素材"，不会出现在音乐库/网页端）
+                    await MainActor.run { message = "音频处理完成，正在生成歌曲（4/4）…" }
+                    let ext2 = (fileName as NSString).pathExtension.lowercased()
+                    let cdnUrl = uploadStatus.audio_url ?? "https://cdn1.suno.ai/\(uploadReq.id).\(ext2.isEmpty ? "mp3" : ext2)"
+                    var audioPayload = buildPayload()
+                    audioPayload.generation_type = "AUDIO_UPLOAD"
+                    audioPayload.audio_url = cdnUrl
+                    let stubs = try await SunoAPI.shared.generate(payload: audioPayload)
+                    let ids = stubs.map { $0.id }
+                    await MainActor.run { message = "已提交，Suno 创作中（\(ids.count) 首）…" }
+                    
+                    var finished = false
+                    var rounds = 0
+                    var consecutiveErrors = 0
+                    while !finished && rounds < 90 {
+                        try await Task.sleep(nanoseconds: 4_000_000_000)
+                        rounds += 1
+                        do {
+                            let clips = try await SunoAPI.shared.feed(ids: ids)
+                            consecutiveErrors = 0
+                            for c in clips {
+                                await MainActor.run { store.update(Song.from(clip: c)) }
+                            }
+                            finished = clips.allSatisfy { ($0.status ?? "streaming") == "complete" || ($0.status ?? "") == "error" }
+                        } catch {
+                            consecutiveErrors += 1
+                            guard consecutiveErrors >= 5 else {
+                                await MainActor.run { message = "轮询中…(\(rounds) \(consecutiveErrors)次暂失败，继续等待)" }
+                                continue
+                            }
+                            throw error
+                        }
+                        await MainActor.run { message = finished ? "✅ 创作完成！" : "创作中…(\(rounds)×4s)" }
+                    }
+                    
                     await MainActor.run {
-                        message = "✅ 音频上传成功！已加入音乐库，可点击「翻唱」进行改编"
                         busy = false
+                        message = finished ? "✅ 创作完成！已保存到音乐库，下拉刷新查看" : "仍在创作中，可到「音乐库」等待或下拉刷新"
                         resetForm()
                         NotificationCenter.default.post(name: Notification.Name("SunoReloadLibrary"), object: nil)
                     }

@@ -141,12 +141,12 @@ struct SunoAPI {
                 mimeType: fieldsContentType
             )
 
-            DebugLog.shared.info("S3上传", "WebView响应: \(status)")
+            DebugLog.shared.info("S3上传", "CFNetwork响应: \(status)")
             if !(200...299).contains(status) {
                 DebugLog.shared.error("S3上传", "WebView失败[\(status)]: \(body.prefix(300))")
                 throw SunoError.uploadFailed("S3[\(status)]: \(body.prefix(200))")
             }
-            DebugLog.shared.success("S3上传", "WebView上传成功 (\(status))")
+            DebugLog.shared.success("S3上传", "CFNetwork上传成功 (\(status))")
         }
     }
 

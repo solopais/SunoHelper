@@ -119,7 +119,7 @@ struct LibraryView: View {
 
             // 同步加载第 2-3 页，追加到列表
             if lastShouldContinue {
-                for page in 2...3 {
+                for page in 2...2 {
                     try? await Task.sleep(nanoseconds: 800_000_000)  // 页间间隔防 429
                     do {
                         let resp2 = try await SunoAPI.shared.library(page: page)
@@ -162,9 +162,10 @@ struct LibraryView: View {
                 }
             }
 
-            // 3 页加载完后，后台继续预加载剩余
-            if hasMorePages && !allLoaded {
-                Task { await preloadRemaining() }
+            // 最新 40 首已加载，不再全量预加载（用户要求：只显示最新 40 首，不全部刷新）
+            await MainActor.run {
+                allLoaded = true
+                hasMorePages = false
             }
         } catch let error as SunoError {
             await MainActor.run {
