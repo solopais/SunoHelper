@@ -186,7 +186,7 @@ struct GeneratePayload: Encodable {
     var make_instrumental: Bool = false
     var mv: String = SunoModels.defaultMV
     var prompt: String = ""                    // 自定义模式：歌词文本
-    var generation_type: String = "TEXT"        // TEXT / AUDIO_UPLOAD / SIMPLE_REMIX 等（API 枚举校验）
+    var generation_type: String = "TEXT"        // TEXT / AUDIO / IMAGE / VIDEO / TWITTER / SIMPLE_REMIX（API 字面量枚举校验）
     var gpt_description_prompt: String? = nil   // 简单/灵感模式提示词（≤200字）
     var tags: String? = nil                     // 风格标签（逗号分隔）
     var title: String? = nil                    // 歌曲标题

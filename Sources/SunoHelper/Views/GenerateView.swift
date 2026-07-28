@@ -361,8 +361,8 @@ struct GenerateView: View {
                     let ext2 = (fileName as NSString).pathExtension.lowercased()
                     let cdnUrl = uploadStatus.audio_url ?? "https://cdn1.suno.ai/\(uploadReq.id).\(ext2.isEmpty ? "mp3" : ext2)"
                     var audioPayload = buildPayload()
-                    audioPayload.generation_type = "AUDIO_UPLOAD"
-                    audioPayload.audio_url = cdnUrl
+                    audioPayload.generation_type = "AUDIO"
+                    audioPayload.prompt = cdnUrl
                     let stubs = try await SunoAPI.shared.generate(payload: audioPayload)
                     let ids = stubs.map { $0.id }
                     await MainActor.run { message = "已提交，Suno 创作中（\(ids.count) 首）…" }
