@@ -42,8 +42,8 @@ final class S3Uploader {
             body.append(Data("\(value)\(crlf)".utf8))
         }
         body.append(Data("--\(boundary)\(crlf)".utf8))
-        // 真实文件名（对齐 SunoTools 的 seg.fileName；中文名做 percent-encoding 保证合法）
-        let safeName = fileName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? fileName
+        // 真实文件名（1:1 对齐 SunoTools 的 seg.fileName 原始名；直接用 UTF-8 字节写入）
+        let safeName = fileName
         body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"\(safeName)\"\(crlf)".utf8))
         body.append(Data("Content-Type: \(mimeType)\(crlf)\(crlf)".utf8))
         body.append(fileData)
@@ -128,8 +128,13 @@ final class S3Uploader {
             throw SunoError.uploadFailed("S3 上传被拒绝: \(bodyStr.prefix(200))")
         }
         if statusCode == 0 {
-            // 极端：状态头读不到（CFNetwork 偶发）但无 <Error>，乐观判定成功
-            statusCode = 204
+            // 状态头读不到（CFNetwork 偶发）：仅当响应体为空（S3 204 成功特征）才乐观判定成功；
+            // 若响应体非空则很可能是错误信息，判失败让上层重试，避免误判成功导致永远 processing
+            if bodyStr.isEmpty {
+                statusCode = 204
+            } else {
+                throw SunoError.uploadFailed("S3 上传：状态码缺失且响应非空: \(bodyStr.prefix(200))")
+            }
         }
         if (200...299).contains(statusCode) {
             DebugLog.shared.info("S3上传", "CFNetwork 成功 status=\(statusCode) body=\(responseBody.count)B")

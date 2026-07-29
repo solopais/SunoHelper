@@ -76,9 +76,12 @@ struct SunoAPI {
     // 服务端鉴权强依赖此头，缺失会导致上传接口拒收 / 音频不注册。
     static func browserToken() -> String {
         let ts = Int64(Date().timeIntervalSince1970 * 1000)
-        let inner = "{\"timestamp\":\(ts)}".data(using: .utf8) ?? Data()
+        // ⚠️ 1:1 对齐 backend.py browser_token()：json.dumps 默认 separators=(", ", ": ")，
+        // 内层为 {"timestamp": 123...}（冒号后含空格），外层为 {"token": "xxx"}（含空格）。
+        // 之前漏掉空格导致 base64 内容与 PC 版不一致，Upload 接口可能被拒收。
+        let inner = "{\"timestamp\": \(ts)}".data(using: .utf8) ?? Data()
         let b64 = inner.base64EncodedString()
-        return "{\"token\":\"\(b64)\"}"
+        return "{\"token\": \"\(b64)\"}"
     }
 
     // Device-Id（对齐 SunoTools 的 device_id；clean_device_id 后仅保留字母数字-）
@@ -257,8 +260,10 @@ struct SunoAPI {
 
     /// Step 2.5: 报告上传完毕（对齐 upload_one 的 upload-finish，单次发送，client.api 仅对连接错误重试）
     func confirmUploadFinish(uploadId: String, fileName: String) async throws {
+        // ⚠️ 1:1 对齐 backend.py：upload-finish body 仅 {"upload_type":"studio_file_upload"}，
+        // 不带 upload_filename（多余字段可能让 Suno 校验拒绝，使音频永远 processing）
         _ = try await api("POST", "/api/uploads/audio/\(uploadId)/upload-finish/",
-                          body: ["upload_type": "studio_file_upload", "upload_filename": fileName])
+                          body: ["upload_type": "studio_file_upload"])
         DebugLog.shared.success("上传", "upload-finish 成功（Suno 开始处理音频）")
     }
 

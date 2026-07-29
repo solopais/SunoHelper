@@ -23,7 +23,7 @@ targets:
       - Sources/SunoHelper
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.sunohelper.app
+        PRODUCT_BUNDLE_IDENTIFIER: com.sonomobile.app
         PRODUCT_NAME: SunoHelper
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_FILE: Resources/Info.plist
