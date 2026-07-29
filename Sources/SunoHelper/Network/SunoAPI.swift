@@ -439,7 +439,8 @@ struct SunoAPI {
             }
         }
         return AudioUploadStatus(id: uploadResult.uploadId, status: "processing",
-                                  title: nil, audio_url: uploadResult.audioUrl, copyright_muted: nil)
+                                  title: nil, audio_url: uploadResult.audioUrl,
+                                  s3_id: nil, image_url: nil, copyright_muted: nil)
     }
 
     /// 旧接口兼容（内部不再使用）
