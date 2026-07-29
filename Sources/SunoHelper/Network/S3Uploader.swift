@@ -1,67 +1,39 @@
 import Foundation
 import CFNetwork
 
-/// S3 文件上传 — 使用 CFNetwork HTTP/1.1 直接 POST
+/// S3 文件上传 —— 1:1 对齐 SunoTools backend.py 的 s3_upload：
+///   session.post(url, data=fields, files={"file": (fileName, file, mime)}, headers={"Connection":"close"})
+/// 即标准 multipart/form-data：先放所有 fields 表单字段，最后放 file 字段（S3 要求 file 在最后）。
 ///
-/// 为什么不用 URLSession / WKWebView：
-/// - URLSession 在 iOS 上强制走 HTTP/2，向 S3 上传大文件（> 几 MB）时会偶发
-///   NSURLErrorNetworkConnectionLost（-1005），所有 session 配置（default/ephemeral/
-///   shared）和 data/upload 两种方式均失败（v7 实测）。
-/// - WKWebView.load(URLRequest) POST 的底层 NetworkProcess 同样走 HTTP/2，v12 实测也 -1005
-///   （didFailProvisionalNavigation: The network connection was lost）。
-/// - Python urllib（HTTP/1.1）实测可成功上传到同一 S3 预签名 URL（204）。
-///
-/// 因此本实现直接用 CFNetwork 的 CFReadStreamCreateForHTTPRequest 发起 HTTP/1.1 请求。
-/// CFNetwork 的 CFHTTP 层只支持 HTTP/1.0 / 1.1，绝不会协商 HTTP/2，从根上绕开该 bug。
-/// 同步阻塞在后台线程读取响应，简单可靠，且不依赖 JS / base64。
+/// iOS 实现策略：
+///   - 主路径用 URLSession（标准 multipart），最简单可靠；
+///   - 若 URLSession 在传输层失败（iOS HTTP/2 大文件偶发 -1005），回退 CFNetwork HTTP/1.1
+///     （CFHTTP 层只支持 HTTP/1.0/1.1，从根上绕开 HTTP/2 的 -1005）。
+///   - 重试由调用方（SunoAPI.uploadFileToS3）按 SunoTools 的 4 次策略执行。
 final class S3Uploader {
     static let shared = S3Uploader()
     private init() {}
 
-    @discardableResult
+    /// 上传到 S3 预签名 URL。返回 (HTTP 状态码, 响应体)。
+    /// 传输层错误（非 S3 明确拒绝）会回退到 CFNetwork。
     func upload(presignedURL: String, fields: [String: String],
-                fileData: Data, mimeType: String) async throws -> (status: Int, body: String) {
-        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<(Int, String), Error>) in
-            let guardQueue = DispatchQueue(label: "com.sunohelper.s3upload.guard")
-            var didResume = false
-            let finish: (Result<(Int, String), Error>) -> Void = { result in
-                guardQueue.async {
-                    guard !didResume else { return }
-                    didResume = true
-                    switch result {
-                    case .success(let v): continuation.resume(returning: v)
-                    case .failure(let e): continuation.resume(throwing: e)
-                    }
-                }
-            }
-            let watchdog = Task {
-                try? await Task.sleep(nanoseconds: 120_000_000_000)
-                finish(.failure(SunoError.uploadFailed("S3 上传超时(120s)")))
-            }
-            DispatchQueue.global(qos: .userInitiated).async {
-                do {
-                    let result = try Self.performUpload(
-                        presignedURL: presignedURL,
-                        fields: fields,
-                        fileData: fileData,
-                        mimeType: mimeType
-                    )
-                    watchdog.cancel()
-                    finish(.success(result))
-                } catch {
-                    watchdog.cancel()
-                    finish(.failure(error))
-                }
-            }
+                fileData: Data, fileName: String, mimeType: String) async throws -> (Int, String) {
+        do {
+            return try await urlSessionUpload(presignedURL: presignedURL, fields: fields,
+                                              fileData: fileData, fileName: fileName, mimeType: mimeType)
+        } catch let e as SunoError {
+            // S3 明确拒绝（<Error> 或 4xx），属于权威失败，不再重试/回退
+            throw e
+        } catch {
+            DebugLog.shared.info("S3上传", "URLSession 失败(\(error.localizedDescription))，回退 CFNetwork HTTP/1.1")
+            return try cfNetworkUpload(presignedURL: presignedURL, fields: fields,
+                                       fileData: fileData, fileName: fileName, mimeType: mimeType)
         }
     }
 
-    private static func performUpload(presignedURL: String, fields: [String: String],
-                                      fileData: Data, mimeType: String) throws -> (Int, String) {
-        guard let url = URL(string: presignedURL) else {
-            throw SunoError.uploadFailed("S3 URL 无效")
-        }
-        let boundary = "----SunoHelperFormBoundary\(UUID().uuidString)"
+    /// 构造 multipart/form-data body（fields 在前，file 最后 —— 对齐 requests 行为）
+    private func buildBody(fields: [String: String], fileData: Data,
+                           fileName: String, mimeType: String, boundary: String) -> Data {
         var body = Data()
         let crlf = "\r\n"
         for (key, value) in fields {
@@ -70,12 +42,51 @@ final class S3Uploader {
             body.append(Data("\(value)\(crlf)".utf8))
         }
         body.append(Data("--\(boundary)\(crlf)".utf8))
-        body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"audio.mp3\"\(crlf)".utf8))
+        // 真实文件名（对齐 SunoTools 的 seg.fileName；中文名做 percent-encoding 保证合法）
+        let safeName = fileName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? fileName
+        body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"\(safeName)\"\(crlf)".utf8))
         body.append(Data("Content-Type: \(mimeType)\(crlf)\(crlf)".utf8))
         body.append(fileData)
         body.append(Data("\(crlf)--\(boundary)--\(crlf)".utf8))
+        return body
+    }
 
-        DebugLog.shared.info("S3上传", "CFNetwork HTTP/1.1 POST body=\(body.count)B CT=\(mimeType)")
+    // MARK: - 主路径：URLSession（标准 multipart）
+
+    private func urlSessionUpload(presignedURL: String, fields: [String: String],
+                                  fileData: Data, fileName: String, mimeType: String) async throws -> (Int, String) {
+        guard let url = URL(string: presignedURL) else { throw SunoError.uploadFailed("S3 URL 无效") }
+        let boundary = "----SunoHelperFormBoundary\(UUID().uuidString)"
+        let body = buildBody(fields: fields, fileData: fileData, fileName: fileName, mimeType: mimeType, boundary: boundary)
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        req.setValue("close", forHTTPHeaderField: "Connection")
+        req.httpBody = body
+        req.timeoutInterval = 300
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        let bodyStr = String(data: data, encoding: .utf8) ?? ""
+        if bodyStr.contains("<Error>") {
+            throw SunoError.uploadFailed("S3 上传被拒绝: \(bodyStr.prefix(200))")
+        }
+        guard (200...299).contains(code) else {
+            throw SunoError.uploadFailed("S3[\(code)]: \(bodyStr.prefix(200))")
+        }
+        DebugLog.shared.info("S3上传", "URLSession 成功 (\(code)) body=\(bodyStr.count)B")
+        return (code, bodyStr)
+    }
+
+    // MARK: - 兜底路径：CFNetwork HTTP/1.1（规避 iOS HTTP/2 大文件 -1005）
+
+    private func cfNetworkUpload(presignedURL: String, fields: [String: String],
+                                 fileData: Data, fileName: String, mimeType: String) throws -> (Int, String) {
+        guard let url = URL(string: presignedURL) else {
+            throw SunoError.uploadFailed("S3 URL 无效")
+        }
+        let boundary = "----SunoHelperFormBoundary\(UUID().uuidString)"
+        let body = buildBody(fields: fields, fileData: fileData, fileName: fileName, mimeType: mimeType, boundary: boundary)
+        DebugLog.shared.info("S3上传", "CFNetwork HTTP/1.1 POST body=\(body.count)B CT=\(mimeType) file=\(fileName)")
 
         let request = CFHTTPMessageCreateRequest(nil, "POST" as CFString, url as CFURL, kCFHTTPVersion1_1).takeRetainedValue()
         CFHTTPMessageSetHeaderFieldValue(request, "Content-Type" as CFString, "multipart/form-data; boundary=\(boundary)" as CFString)
@@ -83,8 +94,7 @@ final class S3Uploader {
         CFHTTPMessageSetBody(request, body as CFData)
 
         let readStream = CFReadStreamCreateForHTTPRequest(nil, request).takeRetainedValue()
-        // 强制 Connection: close：S3 响应后直接关闭 TCP 连接 → 干净的 EOF（n==0），
-        // 避免 HTTP/1.1 keep-alive 下响应已读完、连接却不关闭导致 CFReadStreamRead 返回 -1 误报“读取响应失败”。
+        // 强制 Connection: close：S3 响应后直接关闭 TCP → 干净 EOF，避免 keep-alive 下误报读取失败
         let pk = CFStreamPropertyKey(rawValue: kCFStreamPropertyHTTPAttemptPersistentConnection)
         CFReadStreamSetProperty(readStream, pk, kCFBooleanFalse)
         guard CFReadStreamOpen(readStream) else {
@@ -98,17 +108,12 @@ final class S3Uploader {
             let n = CFReadStreamRead(readStream, &buffer, buffer.count)
             if n > 0 {
                 responseBody.append(&buffer, count: n)
-            } else if n == 0 {
-                break
             } else {
-                // n < 0：响应阶段传输层报错，多为 keep-alive 下连接被 S3 关闭的 EOF 误报。
-                // 跳出循环，交由下方状态码 / body 做权威判定，避免误报“读取响应失败”。
+                // n==0 干净 EOF；n<0 多为 keep-alive 关闭的 EOF 误报，交由状态码/body 做权威判定
                 break
             }
         }
 
-        // 读取 HTTP 状态码（response header）做权威判定。
-        // 用 CFStreamPropertyKey(rawValue:) 桥接（之前的 as 强转会触发编译错误）。
         let respKey = CFStreamPropertyKey(rawValue: kCFStreamPropertyHTTPResponseHeader)
         var statusCode = 0
         if let prop = CFReadStreamCopyProperty(readStream, respKey) {
@@ -119,16 +124,15 @@ final class S3Uploader {
         }
 
         let bodyStr = String(data: responseBody, encoding: .utf8) ?? ""
-        // S3 失败返回 200 + XML <Error> body（非 4xx），所以无论状态码都必须先查 body。
         if bodyStr.contains("<Error>") {
             throw SunoError.uploadFailed("S3 上传被拒绝: \(bodyStr.prefix(200))")
         }
         if statusCode == 0 {
-            // 极端：状态头读不到（CFNetwork 偶发），但无 <Error>，乐观判定成功
+            // 极端：状态头读不到（CFNetwork 偶发）但无 <Error>，乐观判定成功
             statusCode = 204
         }
         if (200...299).contains(statusCode) {
-            DebugLog.shared.info("S3上传", "CFNetwork 响应 status=\(statusCode) body=\(responseBody.count)B 成功")
+            DebugLog.shared.info("S3上传", "CFNetwork 成功 status=\(statusCode) body=\(responseBody.count)B")
             return (statusCode, bodyStr)
         } else {
             throw SunoError.uploadFailed("S3 上传失败 status=\(statusCode): \(bodyStr.prefix(200))")
