@@ -51,8 +51,8 @@ struct AudioUploadStatus: Decodable {
     let status: String?          // "processing" → "complete" / "error"
     let title: String?
     let audio_url: String?       // 处理完成后可能返回真实 CDN URL（部分接口直接给）
-    let s3_id: String? = nil    // 处理完成后 Suno 分配的 clip/s3 id（initialize-clip 的上游）
-    let image_url: String? = nil // 处理完成后封面图（set_metadata 时用）
+    let s3_id: String?           // 处理完成后 Suno 分配的 clip/s3 id（initialize-clip 的上游）
+    let image_url: String?       // 处理完成后封面图（set_metadata 时用）
     let copyright_muted: Bool?
 }
 
@@ -164,7 +164,10 @@ struct SunoAPI {
         for attempt in 0..<maxAttempts {
             do {
                 let url = URL(string: "\(SunoAPI.base)\(path)")!
-                let reqBody = body.map { try JSONSerialization.data(withJSONObject: $0) }
+                var reqBody: Data?
+                if let b = body {
+                    reqBody = try JSONSerialization.data(withJSONObject: b)
+                }
                 var req = makeRequest(url, method: method, body: reqBody)
                 req.timeoutInterval = timeout
                 let (data, resp) = try await Self.performDataRequest(req, maxAttempts: 1)
@@ -268,7 +271,8 @@ struct SunoAPI {
         let image = resp?["image_url"] as? String
         let title = resp?["title"] as? String
         return AudioUploadStatus(id: id, status: status, title: title,
-                                 audio_url: nil, s3_id: s3id, image_url: image)
+                                 audio_url: nil, s3_id: s3id, image_url: image,
+                                 copyright_muted: nil)
     }
 
     /// Step 4: initialize-clip（对齐 upload_one：拿到 clip_id；失败则由调用方用 s3_id 兜底）
